@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SmartDoc AI</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <main class="layout">
+    <section class="hero">
+      <h1>SmartDoc AI</h1>
+      <p>Local PDF Q&A using RAG (Ollama + FAISS)</p>
+    </section>
+
+    <section class="panel">
+      <h2>Build Index</h2>
+      <form id="build-form">
+        <label>
+          PDFs
+          <input id="pdf-files" type="file" accept="application/pdf" multiple required>
+        </label>
+        <label>
+          Ollama model
+          <input id="ollama-model" type="text" value="qwen2.5:7b">
+        </label>
+        <label>
+          Embedding model
+          <input id="embedding-model" type="text" value="sentence-transformers/paraphrase-multilingual-mpnet-base-v2">
+        </label>
+        <label>
+          Temperature
+          <input id="temperature" type="number" min="0" max="1" step="0.05" value="0.1">
+        </label>
+        <button type="submit">Build RAG Index</button>
+      </form>
+      <p id="build-status" class="status"></p>
+      <div class="metrics">
+        <span>Language: <strong id="metric-language">unknown</strong></span>
+        <span>Chunks: <strong id="metric-chunks">0</strong></span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Ask Question</h2>
+      <div id="chat" class="chat"></div>
+      <form id="ask-form">
+        <input id="question" type="text" placeholder="Ask about your PDF..." required>
+        <button type="submit">Send</button>
+      </form>
+      <p id="ask-status" class="status"></p>
+    </section>
+  </main>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
