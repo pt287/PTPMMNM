@@ -126,7 +126,7 @@ st.markdown(
     """
 <section class="hero">
     <h1>📋 SmartDoc AI - Intelligent Document Q&A System</h1>
-    <p>Hệ thống RAG chạy local để hỏi đáp tài liệu PDF bằng tiếng Việt và tiếng Anh, dùng Ollama + FAISS.</p>
+    <p>Hệ thống RAG chạy local để hỏi đáp tài liệu PDF/DOCX bằng tiếng Việt và tiếng Anh, dùng Ollama + FAISS.</p>
     <div class="feature-row">
         <div class="chip">PDFPlumberLoader</div>
         <div class="chip">Chunk 1000 / Overlap 100</div>
@@ -178,8 +178,8 @@ with st.sidebar:
     st.caption("Đảm bảo Ollama đang chạy: ollama serve")
 
 uploaded_files = st.file_uploader(
-    "Tải lên một hoặc nhiều file PDF",
-    type=["pdf"],
+    "Tải lên một hoặc nhiều file PDF/DOCX",
+    type=["pdf", "docx"],
     accept_multiple_files=True,
 )
 
@@ -187,7 +187,7 @@ build_index = st.button("Build RAG Index", type="primary", use_container_width=T
 
 if build_index:
     if not uploaded_files:
-        st.warning("Vui lòng tải lên ít nhất một file PDF.")
+        st.warning("Vui lòng tải lên ít nhất một file PDF hoặc DOCX.")
     else:
         pdf_items: List[Tuple[str, bytes]] = [(f.name, f.getvalue()) for f in uploaded_files]
         config = RAGConfig(
@@ -253,7 +253,7 @@ if question:
                         else:
                             for item in sources:
                                 st.markdown(
-                                    f"- Chunk {item['chunk_id']} ({item['source']}): {item['preview']}"
+                                    f"- Chunk {item['chunk_id']} ({item['source']}, p.{item.get('page', '?')}): {item['preview']}"
                                 )
 
                     st.session_state.chat_history.append(("assistant", answer))

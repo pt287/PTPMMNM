@@ -1,6 +1,6 @@
-# SmartDoc AI (Local PDF Q&A)
+# SmartDoc AI (Local Document Q&A)
 
-Ung dung hoi dap tai lieu PDF theo kien truc RAG, ho tro tieng Viet va tieng Anh.
+Ung dung hoi dap tai lieu PDF/DOCX theo kien truc RAG, ho tro tieng Viet va tieng Anh.
 
 ## Cai Dat Day Du (Windows)
 
@@ -64,8 +64,12 @@ Luu y: Ollama khong nam trong requirements.txt vi day la ung dung he thong (khon
 
 ```bash
 ollama pull qwen2.5:7b
+ollama pull qwen2.5:1.5b
+ollama pull qwen2.5:0.5b
 ollama serve
 ```
+
+Neu may RAM thap, uu tien chon model nhe (qwen2.5:0.5b hoac qwen2.5:1.5b) trong form Build RAG Index.
 
 ### 4) Chay web app (frontend + backend)
 
@@ -80,13 +84,13 @@ Sau do mo trinh duyet: http://127.0.0.1:8000
 1. Upload 1 hoac nhieu file PDF.
 2. Bam Build RAG Index.
 3. Dat cau hoi trong khung chat.
-4. Nhan cau tra loi va xem chunk duoc truy hoi.
+4. Nhan cau tra loi va xem chunk + trang duoc truy hoi (neu co).
 
 ## Cau Hinh Chinh
 
 - LLM: qwen2.5:7b (Ollama)
 - Embedding: paraphrase-multilingual-mpnet-base-v2
-- Loader: PDFPlumberLoader
+- Loader: PDFPlumberLoader + Docx2txtLoader
 - Chunk: 1000
 - Overlap: 100
 - Retrieval: top k = 3
@@ -103,9 +107,27 @@ Ban dang dung Python moi (3.12+). Du an da tu dong dung faiss-cpu >= 1.12.0 tron
 - Kiem tra Ollama dang chay: ollama serve
 - Kiem tra model da tai: ollama pull qwen2.5:7b
 
+### Bao loi thieu RAM cho model
+
+Neu gap loi:
+
+`model requires more system memory ... than is available ...`
+
+- Chon model nhe hon trong giao dien: `qwen2.5:0.5b` hoac `qwen2.5:1.5b`
+- Hoac pull model nhe:
+
+```bash
+ollama pull qwen2.5:0.5b
+```
+
 ### PDF khong trich xuat duoc text
 
 - Thu file PDF co text layer (khong phai scan anh)
+
+### DOCX khong doc duoc
+
+- Kiem tra da cai dependency: `pip install -r requirements.txt`
+- Dam bao file la dinh dang `.docx` hop le (khong phai `.doc`)
 
 ### Canh bao Pydantic V1 voi Python 3.14+
 

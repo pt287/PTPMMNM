@@ -1,57 +1,150 @@
 <!doctype html>
-<html lang="en">
+<html lang="vi">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SmartDoc AI</title>
-  <link rel="stylesheet" href="/assets/styles.css">
+  <title>SmartDoc Workspace</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260412g">
 </head>
 <body>
-  <main class="layout">
-    <section class="hero">
-      <h1>SmartDoc AI</h1>
-      <p>Local PDF Q&A using RAG (Ollama + FAISS)</p>
-    </section>
-
-    <section class="panel">
-      <h2>Build Index</h2>
-      <form id="build-form">
-        <label>
-          PDFs
-          <input id="pdf-files" type="file" accept="application/pdf" multiple required>
-        </label>
-        <label>
-          Ollama model
-          <input id="ollama-model" type="text" value="qwen2.5:7b">
-        </label>
-        <label>
-          Embedding model
-          <input id="embedding-model" type="text" value="sentence-transformers/paraphrase-multilingual-mpnet-base-v2">
-        </label>
-        <label>
-          Temperature
-          <input id="temperature" type="number" min="0" max="1" step="0.05" value="0.1">
-        </label>
-        <button type="submit">Build RAG Index</button>
-      </form>
-      <p id="build-status" class="status"></p>
-      <div class="metrics">
-        <span>Language: <strong id="metric-language">unknown</strong></span>
-        <span>Chunks: <strong id="metric-chunks">0</strong></span>
+  <div class="ambient-bg" aria-hidden="true"></div>
+  <main id="app-grid" class="app-frame">
+    <aside id="history-sidebar" class="left-sidebar">
+      <div class="sidebar-top">
+        <p class="brand">SmartDoc AI</p>
+        <div class="history-head-actions">
+          <button id="history-toggle" type="button" class="btn-ghost small" data-i18n="collapseHistory">Thu gọn</button>
+          <button id="refresh-history" type="button" class="btn-ghost small" data-i18n="refreshHistory">Làm mới</button>
+        </div>
       </div>
+      <section class="history-panel">
+        <h2 data-i18n="uploadHistoryTitle">Lịch sử gửi tài liệu</h2>
+        <div id="history-uploads" class="history-list"></div>
+      </section>
+    </aside>
+
+    <section class="main-panel">
+      <header class="chat-topbar">
+        <div>
+          <h1 data-i18n="heroTitle">Trợ lý đọc tài liệu cho văn phòng và sinh viên</h1>
+          <p class="chat-subtitle" data-i18n="sectionChatDesc">Đặt câu hỏi ngắn gọn, bối cảnh rõ ràng để nhận câu trả lời chính xác hơn.</p>
+        </div>
+        <div class="topbar-controls">
+          <button id="open-guide" type="button" class="btn-ghost" data-i18n="guideButton">Hướng dẫn</button>
+          <label class="lang-switch" for="ui-language">
+            <span data-i18n="languageLabel">Ngôn ngữ</span>
+            <select id="ui-language" aria-label="Language selector">
+              <option value="vi">Tiếng Việt</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+          <div class="status-chip" id="system-status">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span data-i18n="systemReady">Hệ thống sẵn sàng</span>
+          </div>
+        </div>
+      </header>
+
+      <section class="control-strip">
+        <form id="build-form" class="build-form compact">
+          <label>
+            <span data-i18n="pdfLabel">Chọn file PDF/DOCX</span>
+            <input id="pdf-files" type="file" accept="application/pdf,.pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" multiple required>
+          </label>
+          <label>
+            <span data-i18n="modelLabel">Model Ollama</span>
+            <select id="ollama-model" required>
+              <option value="qwen2.5:0.5b">qwen2.5:0.5b (RAM thấp)</option>
+              <option value="qwen2.5:1.5b">qwen2.5:1.5b</option>
+              <option value="qwen2.5:3b">qwen2.5:3b</option>
+              <option value="qwen2.5:7b">qwen2.5:7b (chất lượng cao)</option>
+            </select>
+          </label>
+          <button type="submit" class="btn-primary" data-i18n="buildButton">Tạo RAG Index</button>
+        </form>
+      </section>
+
+      <div id="build-progress" class="progress-wrap" aria-hidden="true">
+        <div id="build-progress-bar" class="progress-bar"></div>
+      </div>
+      <p id="build-status" class="status"></p>
+      <div class="metrics-inline">
+        <p><span data-i18n="metricLanguage">Ngôn ngữ</span>: <strong id="metric-language">unknown</strong></p>
+        <p><span data-i18n="metricChunks">Số chunk</span>: <strong id="metric-chunks">0</strong></p>
+      </div>
+
+      <section class="chat-shell">
+        <div class="chat-actions">
+          <h2 data-i18n="sectionChatTitle">2. Hỏi đáp thông minh</h2>
+          <button id="clear-chat" type="button" class="btn-ghost" data-i18n="clearChat">Xóa chat</button>
+        </div>
+        <div id="chat" class="chat" aria-live="polite"></div>
+        <div class="composer-area">
+          <div class="quick-questions">
+            <button
+              type="button"
+              class="suggestion"
+              data-question-vi="Tóm tắt 5 ý chính trong tài liệu"
+              data-question-en="Summarize the top 5 key points in this document"
+              data-i18n="suggestionSummary"
+            >Tóm tắt 5 ý chính</button>
+            <button
+              type="button"
+              class="suggestion"
+              data-question-vi="Liệt kê các mốc hành động quan trọng"
+              data-question-en="List important action items and deadlines"
+              data-i18n="suggestionAction"
+            >Liệt kê mốc hành động</button>
+            <button
+              type="button"
+              class="suggestion"
+              data-question-vi="So sánh 2 nội dung quan trọng trong tài liệu"
+              data-question-en="Compare two important sections in this document"
+              data-i18n="suggestionCompare"
+            >So sánh 2 nội dung</button>
+          </div>
+          <form id="ask-form" class="ask-form">
+            <input
+              id="question"
+              type="text"
+              placeholder="Ví dụ: Rút gọn tài liệu thành checklist 1 trang"
+              data-i18n-placeholder="questionPlaceholder"
+              required
+            >
+            <button type="submit" class="btn-primary" data-i18n="askButton">Gửi câu hỏi</button>
+          </form>
+          <p id="ask-status" class="status"><span id="ask-spinner" class="inline-spinner" aria-hidden="true"></span><span id="ask-status-text"></span></p>
+        </div>
+      </section>
     </section>
 
-    <section class="panel">
-      <h2>Ask Question</h2>
-      <div id="chat" class="chat"></div>
-      <form id="ask-form">
-        <input id="question" type="text" placeholder="Ask about your PDF..." required>
-        <button type="submit">Send</button>
-      </form>
-      <p id="ask-status" class="status"></p>
-    </section>
+    <div id="guide-popup" class="guide-popup" aria-hidden="true">
+      <div class="guide-dialog" role="dialog" aria-modal="true" aria-labelledby="guide-title">
+        <div class="guide-head">
+          <h2 id="guide-title" data-i18n="workflowTitle">Quy trình 3 bước</h2>
+          <button id="close-guide" type="button" class="btn-ghost small" data-i18n="closeGuide">Đóng</button>
+        </div>
+        <ol class="steps">
+          <li>
+            <strong data-i18n="step1Title">Nạp tài liệu</strong>
+            <span data-i18n="step1Desc">Tải lên một hoặc nhiều file PDF hoặc DOCX để tạo bộ nhớ nội bộ.</span>
+          </li>
+          <li>
+            <strong data-i18n="step2Title">Tạo RAG Index</strong>
+            <span data-i18n="step2Desc">Hệ thống chia đoạn và lập chỉ mục để tra cứu nhanh.</span>
+          </li>
+          <li>
+            <strong data-i18n="step3Title">Hỏi đáp theo ngữ cảnh</strong>
+            <span data-i18n="step3Desc">Đặt câu hỏi và xem nguồn trích dẫn ngay trong khung chat.</span>
+          </li>
+        </ol>
+      </div>
+    </div>
   </main>
 
-  <script src="/assets/app.js"></script>
+  <script src="/assets/app.js?v=20260412b"></script>
 </body>
 </html>
