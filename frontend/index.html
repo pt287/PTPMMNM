@@ -63,6 +63,23 @@
               <option value="qwen2.5:7b">qwen2.5:7b (chất lượng cao)</option>
             </select>
           </label>
+          <label>
+            <span data-i18n="chunkSizeLabel">Chunk size</span>
+            <select id="chunk-size" required>
+              <option value="500">500</option>
+              <option value="1000">1000</option>
+              <option value="1500" selected>1500</option>
+              <option value="2000">2000</option>
+            </select>
+          </label>
+          <label>
+            <span data-i18n="chunkOverlapLabel">Chunk overlap</span>
+            <select id="chunk-overlap" required>
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+            </select>
+          </label>
           <button type="submit" class="btn-primary" data-i18n="buildButton">Tạo RAG Index</button>
         </form>
       </section>
@@ -74,12 +91,18 @@
       <div class="metrics-inline">
         <p><span data-i18n="metricLanguage">Ngôn ngữ</span>: <strong id="metric-language">unknown</strong></p>
         <p><span data-i18n="metricChunks">Số chunk</span>: <strong id="metric-chunks">0</strong></p>
+        <p><span data-i18n="metricChunkSize">Chunk size</span>: <strong id="metric-chunk-size">1500</strong></p>
+        <p><span data-i18n="metricChunkOverlap">Chunk overlap</span>: <strong id="metric-chunk-overlap">100</strong></p>
       </div>
 
       <section class="chat-shell">
         <div class="chat-actions">
           <h2 data-i18n="sectionChatTitle">2. Hỏi đáp thông minh</h2>
-          <button id="clear-chat" type="button" class="btn-ghost" data-i18n="clearChat">Xóa chat</button>
+          <div class="chat-action-buttons">
+            <button id="clear-chat" type="button" class="btn-ghost" data-i18n="clearChat">Xóa chat</button>
+            <button id="clear-history" type="button" class="btn-ghost" data-i18n="clearHistory">Clear History</button>
+            <button id="clear-vector-store" type="button" class="btn-ghost" data-i18n="clearVectorStore">Clear Vector Store</button>
+          </div>
         </div>
         <div id="chat" class="chat" aria-live="polite"></div>
         <div class="composer-area">
@@ -143,8 +166,22 @@
         </ol>
       </div>
     </div>
+
+    <div id="citation-modal" class="guide-popup citation-popup" aria-hidden="true">
+      <div class="guide-dialog citation-dialog" role="dialog" aria-modal="true" aria-labelledby="citation-title">
+        <div class="guide-head">
+          <h2 id="citation-title">Source context</h2>
+          <button id="close-citation" type="button" class="btn-ghost small" data-i18n="closeGuide">Đóng</button>
+        </div>
+        <p id="citation-meta" class="history-meta"></p>
+        <div id="citation-pdf-wrap" class="citation-pdf-wrap">
+          <iframe id="citation-pdf-frame" class="citation-pdf-frame" title="Citation PDF viewer"></iframe>
+        </div>
+        <div id="citation-context" class="citation-context"></div>
+      </div>
+    </div>
   </main>
 
-  <script src="/assets/app.js?v=20260412b"></script>
+  <script src="/assets/app.js?v=20260413e"></script>
 </body>
 </html>

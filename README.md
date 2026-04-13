@@ -90,11 +90,41 @@ Sau do mo trinh duyet: http://127.0.0.1:8000
 
 - LLM: qwen2.5:7b (Ollama)
 - Embedding: paraphrase-multilingual-mpnet-base-v2
-- Loader: PDFPlumberLoader + Docx2txtLoader
-- Chunk: 1000
+- Loader: PDFPlumberLoader + python-docx (DOCX)
+- Chunk: mac dinh 1500 (co the tuy chinh tren UI)
 - Overlap: 100
 - Retrieval: top k = 3
 - Vector DB: FAISS
+
+## Tuy Chinh Chunk Parameters
+
+- Trong form Build RAG Index, co the chon cac gia tri sau.
+- Chunk size: `500 | 1000 | 1500 | 2000`
+- Chunk overlap: `50 | 100 | 200`
+- He thong luu theo tung session, khi mo lai session se dung dung cau hinh chunk da build truoc do.
+
+## Benchmark Chunk Strategy
+
+Da them script benchmark de so sanh 12 cau hinh chunk/overlap va bao cao retrieval accuracy.
+
+Chay benchmark:
+
+```bash
+python documentation/chunk_strategy_benchmark.py --uploads-dir data/uploads --output documentation/chunk_strategy_report.md
+```
+
+Ket qua report se nam o:
+
+- `documentation/chunk_strategy_report.md`
+
+Ket qua gan nhat (tren du lieu hien tai):
+
+- Top-3 tot nhat: `chunk_size=1500`, `chunk_overlap=100` (61.90%)
+- Top-1 cao nhat: `chunk_size=1000`, `chunk_overlap=200` (40.00%)
+
+Khuyen nghi:
+
+- Mac dinh su dung `1500/100` de uu tien do bao phu retrieval (Top-3).
 
 ## Loi Thuong Gap
 

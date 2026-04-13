@@ -120,9 +120,14 @@ body {
 .lang-switch select {
   border: 1px solid rgba(232, 238, 247, 0.55);
   border-radius: 999px;
-  background: rgba(244, 247, 255, 0.18);
-  color: #f8fbff;
+  background: #f3f7fb;
+  color: #24323d;
   padding: 5px 9px;
+}
+
+.lang-switch select option {
+  background: #ffffff;
+  color: #24323d;
 }
 
 .lang-switch select:focus {
@@ -178,7 +183,7 @@ body {
 
 .build-form {
   display: grid;
-  grid-template-columns: minmax(260px, 1.45fr) minmax(220px, 0.85fr) auto;
+  grid-template-columns: minmax(240px, 1.35fr) minmax(200px, 0.85fr) minmax(130px, 0.5fr) minmax(130px, 0.5fr) auto;
   gap: 8px;
   padding: 12px;
   align-items: end;
@@ -310,6 +315,13 @@ select:focus {
   padding: 10px 12px;
 }
 
+.chat-action-buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .chat-actions h2 {
   margin: 0;
   font-size: 1rem;
@@ -349,6 +361,45 @@ select:focus {
   border-top: 1px dashed #c5d3e5;
   font-size: 0.84rem;
   color: var(--muted);
+}
+
+.sources-title {
+  margin: 0 0 8px;
+  font-weight: 600;
+  color: #3d5363;
+}
+
+.source-item {
+  width: 100%;
+  display: grid;
+  gap: 4px;
+  text-align: left;
+  background: #f7fbff;
+  border: 1px solid #d8e4ee;
+  border-radius: 10px;
+  padding: 8px;
+  margin-bottom: 6px;
+}
+
+.source-item:hover {
+  border-color: #9cb8c6;
+  background: #f1f7fb;
+}
+
+.source-meta {
+  font-size: 0.78rem;
+  color: #547082;
+}
+
+.source-preview {
+  font-size: 0.83rem;
+  color: #2f4353;
+}
+
+.source-open {
+  font-size: 0.78rem;
+  color: #3f6475;
+  text-decoration: underline;
 }
 
 .composer-area {
@@ -540,6 +591,62 @@ select:focus {
   display: flex;
 }
 
+.citation-popup {
+  z-index: 45;
+}
+
+.citation-dialog {
+  width: min(1220px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  display: flex;
+  flex-direction: column;
+}
+
+.citation-pdf-wrap {
+  display: none;
+  border: 1px solid #d9e2eb;
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: 10px;
+  background: #f6f9fc;
+}
+
+.citation-pdf-wrap.show {
+  display: block;
+}
+
+.citation-pdf-frame {
+  width: 100%;
+  height: min(76vh, 900px);
+  border: 0;
+  background: #ffffff;
+}
+
+.citation-context {
+  max-height: min(60vh, 520px);
+  overflow: auto;
+  white-space: pre-wrap;
+  line-height: 1.5;
+  padding: 10px;
+  border: 1px solid #d9e2eb;
+  border-radius: 10px;
+  background: #fbfdff;
+  color: #2f4050;
+  font-size: 0.92rem;
+}
+
+.citation-context mark {
+  background: #ffe08a;
+  color: #253241;
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.citation-empty {
+  margin: 0;
+  color: var(--muted);
+}
+
 .guide-dialog {
   width: min(560px, calc(100vw - 24px));
   background: #ffffff;
@@ -584,7 +691,7 @@ select:focus {
 
 @media (max-width: 1180px) {
   .build-form {
-    grid-template-columns: 1fr 1fr auto;
+    grid-template-columns: 1fr 1fr 1fr;
   }
 }
 
@@ -623,6 +730,16 @@ select:focus {
 
   .ask-form {
     grid-template-columns: 1fr;
+  }
+
+  .chat-actions {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .chat-action-buttons {
+    width: 100%;
   }
 
   .btn-primary {

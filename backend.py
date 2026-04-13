@@ -1,6 +1,8 @@
 import time
 import json
 import sqlite3
+import shutil
+import unicodedata
 from threading import Lock
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -32,6 +34,8 @@ class AppState:
         self.qa_chain = None
         self.doc_language = "unknown"
         self.chunk_count = 0
+        self.chunk_size = 1500
+        self.chunk_overlap = 100
         self.current_session_id: Optional[int] = None
         self.conversation_history: List[tuple[str, str]] = []
 
@@ -42,6 +46,7 @@ state = AppState()
 def _get_connection() -> sqlite3.Connection:
     db_dir.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -56,6 +61,8 @@ def _init_db() -> None:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     doc_language TEXT NOT NULL,
                     chunk_count INTEGER NOT NULL,
+                    chunk_size INTEGER NOT NULL DEFAULT 1500,
+                    chunk_overlap INTEGER NOT NULL DEFAULT 100,
                     ollama_model TEXT NOT NULL,
                     embedding_model TEXT NOT NULL,
                     temperature REAL NOT NULL
@@ -95,6 +102,15 @@ def _init_db() -> None:
             }
             if "stored_path" not in pdf_columns:
                 conn.execute("ALTER TABLE session_pdfs ADD COLUMN stored_path TEXT")
+
+            session_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(index_sessions)").fetchall()
+            }
+            if "chunk_size" not in session_columns:
+                conn.execute("ALTER TABLE index_sessions ADD COLUMN chunk_size INTEGER NOT NULL DEFAULT 1500")
+            if "chunk_overlap" not in session_columns:
+                conn.execute("ALTER TABLE index_sessions ADD COLUMN chunk_overlap INTEGER NOT NULL DEFAULT 100")
             conn.commit()
 
 
@@ -125,6 +141,8 @@ def _store_index_session(
     *,
     doc_language: str,
     chunk_count: int,
+    chunk_size: int,
+    chunk_overlap: int,
     ollama_model: str,
     embedding_model: str,
     temperature: float,
@@ -135,10 +153,18 @@ def _store_index_session(
             cursor = conn.execute(
                 """
                 INSERT INTO index_sessions (
-                    doc_language, chunk_count, ollama_model, embedding_model, temperature
-                ) VALUES (?, ?, ?, ?, ?)
+                    doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (doc_language, chunk_count, ollama_model, embedding_model, temperature),
+                (
+                    doc_language,
+                    chunk_count,
+                    chunk_size,
+                    chunk_overlap,
+                    ollama_model,
+                    embedding_model,
+                    temperature,
+                ),
             )
             session_id = int(cursor.lastrowid)
 
@@ -191,7 +217,7 @@ def _fetch_upload_history(limit: int) -> List[Dict[str, Any]]:
         with _get_connection() as conn:
             sessions = conn.execute(
                 """
-                SELECT id, created_at, doc_language, chunk_count, ollama_model, embedding_model, temperature
+                SELECT id, created_at, doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature
                 FROM index_sessions
                 ORDER BY id DESC
                 LIMIT ?
@@ -222,6 +248,8 @@ def _fetch_upload_history(limit: int) -> List[Dict[str, Any]]:
                         "created_at": row["created_at"],
                         "doc_language": row["doc_language"],
                         "chunk_count": row["chunk_count"],
+                        "chunk_size": row["chunk_size"],
+                        "chunk_overlap": row["chunk_overlap"],
                         "ollama_model": row["ollama_model"],
                         "embedding_model": row["embedding_model"],
                         "temperature": row["temperature"],
@@ -290,6 +318,54 @@ def _fetch_session_files(session_id: int) -> List[Dict[str, Any]]:
     ]
 
 
+def _resolve_session_file_path(session_id: int, file_name: str) -> Optional[Path]:
+    normalized_target = unicodedata.normalize("NFC", Path(file_name).name).casefold()
+
+    with db_lock:
+        with _get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT stored_path
+                FROM session_pdfs
+                WHERE session_id = ? AND file_name = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (session_id, file_name),
+            ).fetchone()
+
+            if row is None:
+                candidate_rows = conn.execute(
+                    """
+                    SELECT file_name, stored_path
+                    FROM session_pdfs
+                    WHERE session_id = ?
+                    ORDER BY id DESC
+                    """,
+                    (session_id,),
+                ).fetchall()
+                for candidate in candidate_rows:
+                    candidate_name = unicodedata.normalize(
+                        "NFC", Path(candidate["file_name"]).name
+                    ).casefold()
+                    if candidate_name == normalized_target:
+                        row = candidate
+                        break
+
+    if row is None:
+        return None
+
+    stored_path = row["stored_path"]
+    if not stored_path:
+        return None
+
+    path = Path(stored_path)
+    if not path.exists():
+        return None
+
+    return path
+
+
 def _fetch_qa_by_session(session_id: int, limit: int) -> List[Dict[str, Any]]:
     with db_lock:
         with _get_connection() as conn:
@@ -331,7 +407,7 @@ def _fetch_session_info(session_id: int) -> Optional[Dict[str, Any]]:
         with _get_connection() as conn:
             row = conn.execute(
                 """
-                SELECT id, created_at, doc_language, chunk_count, ollama_model, embedding_model, temperature
+                SELECT id, created_at, doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature
                 FROM index_sessions
                 WHERE id = ?
                 """,
@@ -346,9 +422,47 @@ def _fetch_session_info(session_id: int) -> Optional[Dict[str, Any]]:
         "created_at": row["created_at"],
         "doc_language": row["doc_language"],
         "chunk_count": row["chunk_count"],
+        "chunk_size": row["chunk_size"],
+        "chunk_overlap": row["chunk_overlap"],
         "ollama_model": row["ollama_model"],
         "embedding_model": row["embedding_model"],
         "temperature": row["temperature"],
+    }
+
+
+def _clear_chat_history(session_id: Optional[int]) -> int:
+    if session_id is None:
+        return 0
+
+    with db_lock:
+        with _get_connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM qa_history WHERE session_id = ?",
+                (session_id,),
+            )
+            conn.commit()
+    return max(0, cursor.rowcount)
+
+
+def _clear_vector_store_data() -> Dict[str, int]:
+    with db_lock:
+        with _get_connection() as conn:
+            # Keep chat rows but detach them from removed upload/index sessions.
+            conn.execute("UPDATE qa_history SET session_id = NULL WHERE session_id IS NOT NULL")
+            file_cursor = conn.execute("DELETE FROM session_pdfs")
+            session_cursor = conn.execute("DELETE FROM index_sessions")
+            conn.commit()
+
+    removed_files = max(0, file_cursor.rowcount)
+    removed_sessions = max(0, session_cursor.rowcount)
+
+    if uploads_dir.exists():
+        shutil.rmtree(uploads_dir, ignore_errors=True)
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "removed_files": removed_files,
+        "removed_sessions": removed_sessions,
     }
 
 
@@ -372,6 +486,8 @@ def health() -> dict:
         "indexed": state.qa_chain is not None,
         "doc_language": state.doc_language,
         "chunk_count": state.chunk_count,
+        "chunk_size": state.chunk_size,
+        "chunk_overlap": state.chunk_overlap,
     }
 
 
@@ -399,6 +515,8 @@ def session_history(session_id: int, limit: int = 30) -> dict:
             "created_at": session["created_at"],
             "doc_language": session["doc_language"],
             "chunk_count": session["chunk_count"],
+            "chunk_size": session["chunk_size"],
+            "chunk_overlap": session["chunk_overlap"],
             "pdf_files": [
                 {"file_name": item["file_name"], "file_size": item["file_size"]}
                 for item in files
@@ -446,8 +564,8 @@ def activate_session(session_id: int) -> dict:
     config = RAGConfig(
         embedding_model=session["embedding_model"],
         ollama_model=session["ollama_model"],
-        chunk_size=1000,
-        chunk_overlap=100,
+        chunk_size=session["chunk_size"],
+        chunk_overlap=session["chunk_overlap"],
         top_k=3,
         temperature=session["temperature"],
     )
@@ -460,6 +578,8 @@ def activate_session(session_id: int) -> dict:
     state.qa_chain = qa_chain
     state.doc_language = doc_language
     state.chunk_count = chunk_count
+    state.chunk_size = session["chunk_size"]
+    state.chunk_overlap = session["chunk_overlap"]
     state.current_session_id = session_id
     state.conversation_history = []
 
@@ -468,7 +588,27 @@ def activate_session(session_id: int) -> dict:
         "session_id": session_id,
         "doc_language": doc_language,
         "chunk_count": chunk_count,
+        "chunk_size": session["chunk_size"],
+        "chunk_overlap": session["chunk_overlap"],
     }
+
+
+@app.get("/api/sessions/{session_id}/file")
+def get_session_file(session_id: int, file_name: str) -> FileResponse:
+    path = _resolve_session_file_path(session_id, file_name)
+    if path is None:
+        raise HTTPException(status_code=404, detail="File not found in this session.")
+
+    media_type = "application/pdf" if path.suffix.lower() == ".pdf" else None
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=path.name,
+        content_disposition_type="inline",
+        headers={
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.post("/api/build-index")
@@ -476,6 +616,8 @@ async def build_index(
     files: List[UploadFile] = File(...),
     ollama_model: str = Form("qwen2.5:0.5b"),
     embedding_model: str = Form("sentence-transformers/paraphrase-multilingual-mpnet-base-v2"),
+    chunk_size: int = Form(1500),
+    chunk_overlap: int = Form(100),
     temperature: float = Form(0.1),
 ) -> dict:
     if not files:
@@ -500,11 +642,18 @@ async def build_index(
             }
         )
 
+    if chunk_size <= 0:
+        raise HTTPException(status_code=400, detail="chunk_size must be greater than 0.")
+    if chunk_overlap < 0:
+        raise HTTPException(status_code=400, detail="chunk_overlap cannot be negative.")
+    if chunk_overlap >= chunk_size:
+        raise HTTPException(status_code=400, detail="chunk_overlap must be smaller than chunk_size.")
+
     config = RAGConfig(
         embedding_model=embedding_model,
         ollama_model=ollama_model,
-        chunk_size=1000,
-        chunk_overlap=100,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
         top_k=3,
         temperature=temperature,
     )
@@ -517,10 +666,14 @@ async def build_index(
     state.qa_chain = qa_chain
     state.doc_language = doc_language
     state.chunk_count = chunk_count
+    state.chunk_size = chunk_size
+    state.chunk_overlap = chunk_overlap
     state.conversation_history = []
     state.current_session_id = _store_index_session(
         doc_language=doc_language,
         chunk_count=chunk_count,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
         ollama_model=ollama_model,
         embedding_model=embedding_model,
         temperature=temperature,
@@ -531,6 +684,8 @@ async def build_index(
         "message": "RAG index built successfully.",
         "doc_language": doc_language,
         "chunk_count": chunk_count,
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
         "session_id": state.current_session_id,
     }
 
@@ -597,4 +752,41 @@ def ask(payload: AskPayload) -> dict:
         "answer": answer,
         "sources": sources,
         "response_time": response_time,
+    }
+
+
+@app.delete("/api/history")
+def clear_history(session_id: Optional[int] = None) -> dict:
+    target_session_id = session_id if session_id is not None else state.current_session_id
+    if target_session_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No active session found. Hãy build index hoặc chọn session trước khi xóa lịch sử.",
+        )
+
+    deleted_rows = _clear_chat_history(target_session_id)
+    state.conversation_history = []
+    return {
+        "message": "Current session chat history cleared.",
+        "session_id": target_session_id,
+        "deleted_rows": deleted_rows,
+    }
+
+
+@app.delete("/api/vector-store")
+def clear_vector_store() -> dict:
+    result = _clear_vector_store_data()
+
+    state.qa_chain = None
+    state.doc_language = "unknown"
+    state.chunk_count = 0
+    state.chunk_size = 1500
+    state.chunk_overlap = 100
+    state.current_session_id = None
+    state.conversation_history = []
+
+    return {
+        "message": "Vector store and uploaded documents cleared.",
+        "removed_sessions": result["removed_sessions"],
+        "removed_files": result["removed_files"],
     }

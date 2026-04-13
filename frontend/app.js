@@ -3,11 +3,20 @@ const askForm = document.getElementById("ask-form");
 const chat = document.getElementById("chat");
 const questionInput = document.getElementById("question");
 const clearChatButton = document.getElementById("clear-chat");
+const clearHistoryButton = document.getElementById("clear-history");
+const clearVectorStoreButton = document.getElementById("clear-vector-store");
 const refreshHistoryButton = document.getElementById("refresh-history");
 const historyToggleButton = document.getElementById("history-toggle");
 const openGuideButton = document.getElementById("open-guide");
 const closeGuideButton = document.getElementById("close-guide");
 const guidePopup = document.getElementById("guide-popup");
+const citationModal = document.getElementById("citation-modal");
+const citationCloseButton = document.getElementById("close-citation");
+const citationTitle = document.getElementById("citation-title");
+const citationMeta = document.getElementById("citation-meta");
+const citationPdfWrap = document.getElementById("citation-pdf-wrap");
+const citationPdfFrame = document.getElementById("citation-pdf-frame");
+const citationContext = document.getElementById("citation-context");
 const appGrid = document.getElementById("app-grid");
 const systemStatus = document.getElementById("system-status");
 const suggestionButtons = document.querySelectorAll(".suggestion");
@@ -21,8 +30,12 @@ const askSpinner = document.getElementById("ask-spinner");
 const buildProgressWrap = document.getElementById("build-progress");
 const buildProgressBar = document.getElementById("build-progress-bar");
 const modelSelect = document.getElementById("ollama-model");
+const chunkSizeSelect = document.getElementById("chunk-size");
+const chunkOverlapSelect = document.getElementById("chunk-overlap");
 const metricLanguage = document.getElementById("metric-language");
 const metricChunks = document.getElementById("metric-chunks");
+const metricChunkSize = document.getElementById("metric-chunk-size");
+const metricChunkOverlap = document.getElementById("metric-chunk-overlap");
 
 const translations = {
   vi: {
@@ -39,14 +52,20 @@ const translations = {
     step3Desc: "Đặt câu hỏi và xem nguồn trích dẫn ngay trong khung chat.",
     metricLanguage: "Ngôn ngữ",
     metricChunks: "Số chunk",
+    metricChunkSize: "Chunk size",
+    metricChunkOverlap: "Chunk overlap",
     sectionConfigTitle: "1. Tài liệu",
     sectionConfigDesc: "Dành cho bài tập, báo cáo, quy trình nghiệp vụ, tài liệu họp.",
     pdfLabel: "Chọn file PDF/DOCX",
     modelLabel: "Model Ollama",
+    chunkSizeLabel: "Chunk size",
+    chunkOverlapLabel: "Chunk overlap",
     buildButton: "Tạo RAG Index",
     sectionChatTitle: "2. Hỏi đáp thông minh",
     sectionChatDesc: "Đặt câu hỏi ngắn gọn, bối cảnh rõ ràng để nhận câu trả lời chính xác hơn.",
-    clearChat: "Xóa chat",
+    clearChat: "Xóa màn hình chat",
+    clearHistory: "Clear History",
+    clearVectorStore: "Clear Vector Store",
     suggestionSummary: "Tóm tắt 5 ý chính",
     suggestionAction: "Liệt kê mốc hành động",
     suggestionCompare: "So sánh 2 nội dung",
@@ -64,8 +83,22 @@ const translations = {
     statusDone: "Hoàn tất.",
     statusFailed: "Thất bại.",
     statusChatCleared: "Đã xóa lịch sử chat.",
+    statusHistoryCleared: "Đã xóa lịch sử chat của phiên hiện tại.",
+    statusVectorStoreCleared: "Đã xóa tài liệu upload và vector store.",
+    confirmClearHistory: "Bạn có chắc muốn xóa toàn bộ lịch sử chat không?",
+    confirmClearVectorStore: "Bạn có chắc muốn xóa toàn bộ tài liệu đã upload và vector store không?",
+    statusNoSessionToClear: "Không có session để xóa lịch sử. Hãy build index hoặc chọn 1 session trong lịch sử.",
     responseTime: "Thời gian phản hồi",
     sourcePrefix: "Đoạn",
+    sourcesLabel: "Nguồn tham chiếu",
+    openSourceContext: "Xem context gốc",
+    sourceUnknownPage: "Không rõ trang",
+    sourceUnknownPosition: "Không rõ vị trí",
+    sourcePageLabel: "Trang",
+    sourcePositionLabel: "Vị trí",
+    sourceChunkLabel: "Chunk",
+    sourcePreviewLabel: "Trích đoạn",
+    sourceNoContext: "Không có context cho nguồn này.",
     sectionHistoryTitle: "3. Lịch sử làm việc",
     sectionHistoryDesc: "Chỉ hiển thị lịch sử gửi tài liệu. Bấm vào từng mục để xem hội thoại và hỏi tiếp.",
     refreshHistory: "Làm mới",
@@ -102,14 +135,20 @@ const translations = {
     step3Desc: "Ask questions and review cited sources in chat.",
     metricLanguage: "Language",
     metricChunks: "Chunks",
+    metricChunkSize: "Chunk size",
+    metricChunkOverlap: "Chunk overlap",
     sectionConfigTitle: "1. Documents",
     sectionConfigDesc: "Great for homework, reports, business workflows, and meeting docs.",
     pdfLabel: "Select PDF/DOCX files",
     modelLabel: "Ollama model",
+    chunkSizeLabel: "Chunk size",
+    chunkOverlapLabel: "Chunk overlap",
     buildButton: "Build RAG Index",
     sectionChatTitle: "2. Smart Q&A",
     sectionChatDesc: "Ask concise, contextual questions for more accurate answers.",
-    clearChat: "Clear chat",
+    clearChat: "Clear Chat Screen",
+    clearHistory: "Clear History",
+    clearVectorStore: "Clear Vector Store",
     suggestionSummary: "Summarize top 5 points",
     suggestionAction: "List action items",
     suggestionCompare: "Compare 2 sections",
@@ -127,8 +166,22 @@ const translations = {
     statusDone: "Done.",
     statusFailed: "Failed.",
     statusChatCleared: "Chat history has been cleared.",
+    statusHistoryCleared: "Current session chat history has been cleared.",
+    statusVectorStoreCleared: "Uploaded documents and vector store have been cleared.",
+    confirmClearHistory: "Are you sure you want to clear all chat history?",
+    confirmClearVectorStore: "Are you sure you want to clear all uploaded documents and vector store?",
+    statusNoSessionToClear: "No session available to clear. Build index or choose a session from history first.",
     responseTime: "Response time",
     sourcePrefix: "Chunk",
+    sourcesLabel: "Citations",
+    openSourceContext: "Open source context",
+    sourceUnknownPage: "Unknown page",
+    sourceUnknownPosition: "Unknown position",
+    sourcePageLabel: "Page",
+    sourcePositionLabel: "Position",
+    sourceChunkLabel: "Chunk",
+    sourcePreviewLabel: "Excerpt",
+    sourceNoContext: "No context is available for this source.",
     sectionHistoryTitle: "3. Activity history",
     sectionHistoryDesc: "Shows document upload history only. Click an item to view Q&A and continue with that file.",
     refreshHistory: "Refresh",
@@ -157,6 +210,7 @@ const savedLanguage = localStorage.getItem("smartdoc_ui_language");
 let currentLanguage = savedLanguage && translations[savedLanguage] ? savedLanguage : "vi";
 let hasIndexedData = false;
 let activeSessionId = null;
+let latestSessionId = null;
 let isHistoryCollapsed = localStorage.getItem("smartdoc_history_collapsed") === "1";
 let isGuideDismissed = localStorage.getItem("smartdoc_guide_dismissed") === "1";
 
@@ -231,17 +285,149 @@ function addMessage(role, text, sources = []) {
   if (role === "assistant" && sources.length > 0) {
     const sourceBox = document.createElement("div");
     sourceBox.className = "sources";
-    sourceBox.textContent = sources
-      .map((s) => {
-        const page = s.page !== undefined && s.page !== null ? `, p.${s.page}` : "";
-        return `${t("sourcePrefix")} ${s.chunk_id} (${s.source}${page}): ${s.preview}`;
-      })
-      .join("\n");
+
+    const sourceTitle = document.createElement("p");
+    sourceTitle.className = "sources-title";
+    sourceTitle.textContent = t("sourcesLabel");
+    sourceBox.appendChild(sourceTitle);
+
+    sources.forEach((source) => {
+      const sourceButton = document.createElement("button");
+      sourceButton.type = "button";
+      sourceButton.className = "source-item";
+
+      const pageText = source.page !== undefined && source.page !== null && source.page !== "?"
+        ? source.page
+        : t("sourceUnknownPage");
+
+      let positionText = t("sourceUnknownPosition");
+      if (Number.isInteger(source.position_start) && Number.isInteger(source.position_end)) {
+        positionText = `${source.position_start}-${source.position_end}`;
+      }
+
+      const meta = `${t("sourcePrefix")} ${source.chunk_id} | ${source.source} | ${t("sourcePageLabel")}: ${pageText} | ${t("sourcePositionLabel")}: ${positionText}`;
+      const safeMeta = escapeHtml(meta);
+      const safePreview = escapeHtml(source.preview || "");
+      sourceButton.innerHTML = `
+        <span class="source-meta">${safeMeta}</span>
+        <span class="source-preview">${safePreview}</span>
+        <span class="source-open">${escapeHtml(t("openSourceContext"))}</span>
+      `;
+
+      sourceButton.addEventListener("click", () => {
+        openCitationModal(source);
+      });
+
+      sourceBox.appendChild(sourceButton);
+    });
+
     item.appendChild(sourceBox);
   }
 
   chat.appendChild(item);
   chat.scrollTop = chat.scrollHeight;
+}
+
+function escapeHtml(input) {
+  return String(input || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function escapeRegExp(input) {
+  return String(input || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildPdfSearchTerm(text) {
+  const normalized = String(text || "")
+    .replace(/\s+/g, " ")
+    .replace(/[\n\r\t]/g, " ")
+    .trim();
+
+  if (!normalized) {
+    return "";
+  }
+
+  const words = normalized
+    .replace(/[.,;:!?()[\]{}"'`~@#$%^&*_+=<>|\\/]/g, " ")
+    .split(" ")
+    .map((w) => w.trim())
+    .filter(Boolean);
+
+  return words.slice(0, 12).join(" ");
+}
+
+function renderCitationContext(contextText, highlightText) {
+  const safeContext = String(contextText || "").trim();
+  if (!safeContext) {
+    return `<p class="citation-empty">${escapeHtml(t("sourceNoContext"))}</p>`;
+  }
+
+  const marker = String(highlightText || "").trim();
+  if (!marker) {
+    return escapeHtml(safeContext);
+  }
+
+  const pattern = new RegExp(escapeRegExp(marker), "i");
+  const match = pattern.exec(safeContext);
+  if (!match) {
+    return escapeHtml(safeContext);
+  }
+
+  const start = match.index;
+  const end = start + match[0].length;
+  const before = escapeHtml(safeContext.slice(0, start));
+  const middle = escapeHtml(safeContext.slice(start, end));
+  const after = escapeHtml(safeContext.slice(end));
+  return `${before}<mark>${middle}</mark>${after}`;
+}
+
+function openCitationModal(source) {
+  const pageText = source.page !== undefined && source.page !== null && source.page !== "?"
+    ? String(source.page)
+    : t("sourceUnknownPage");
+
+  let positionText = t("sourceUnknownPosition");
+  if (Number.isInteger(source.position_start) && Number.isInteger(source.position_end)) {
+    positionText = `${source.position_start}-${source.position_end}`;
+  }
+
+  citationTitle.textContent = `${t("sourceChunkLabel")} ${source.chunk_id} | ${source.source}`;
+  citationMeta.textContent = `${t("sourcePageLabel")}: ${pageText} | ${t("sourcePositionLabel")}: ${positionText}`;
+
+  const contextText = source.context_text || source.preview || "";
+  const highlightText = source.highlight_text || source.preview || "";
+  citationContext.style.display = "block";
+  citationContext.innerHTML = renderCitationContext(contextText, highlightText);
+
+  const sourceName = String(source.source || "");
+  const isPdfSource = sourceName.toLowerCase().endsWith(".pdf");
+
+  if (isPdfSource && activeSessionId) {
+    const safeFile = encodeURIComponent(sourceName);
+    const searchTerm = buildPdfSearchTerm(highlightText || contextText || "");
+    const safeSearch = encodeURIComponent(searchTerm);
+    const pageNumber = Number.isInteger(source.page) ? source.page : 1;
+    citationPdfFrame.src = `/api/sessions/${activeSessionId}/file?file_name=${safeFile}#page=${pageNumber}&zoom=page-width&search=${safeSearch}`;
+    citationPdfWrap.classList.add("show");
+    citationContext.style.display = "none";
+  } else {
+    citationPdfFrame.src = "about:blank";
+    citationPdfWrap.classList.remove("show");
+    citationContext.style.display = "block";
+  }
+
+  citationModal.classList.add("show");
+  citationModal.setAttribute("aria-hidden", "false");
+}
+
+function closeCitationModal() {
+  citationPdfFrame.src = "about:blank";
+  citationModal.classList.remove("show");
+  citationModal.setAttribute("aria-hidden", "true");
 }
 
 function setAskStatus(text, loading = false) {
@@ -353,6 +539,10 @@ async function activateSession(sessionId) {
   hasIndexedData = true;
   metricLanguage.textContent = data.doc_language;
   metricChunks.textContent = String(data.chunk_count);
+  metricChunkSize.textContent = String(data.chunk_size || 1500);
+  metricChunkOverlap.textContent = String(data.chunk_overlap || 100);
+  chunkSizeSelect.value = String(data.chunk_size || 1500);
+  chunkOverlapSelect.value = String(data.chunk_overlap || 100);
   setSystemStatus(true, `${t("systemIndexed")} - ${t("sessionIdLabel")} #${sessionId}`);
   setAskStatus(t("sessionReady"), false);
 }
@@ -410,6 +600,7 @@ function attachHistoryActions(root, sessionId, qaContainer, toggleButton, contin
 
 function renderUploadHistory(items) {
   historyUploads.innerHTML = "";
+  latestSessionId = items.length ? items[0].session_id : null;
 
   if (!items.length) {
     const empty = document.createElement("p");
@@ -423,7 +614,7 @@ function renderUploadHistory(items) {
     const files = (entry.pdf_files || []).map((f) => `${f.file_name} (${Math.round(f.file_size / 1024)} KB)`);
     const title = `${t("uploadLabel")} #${entry.session_id}`;
     const activeTag = activeSessionId === entry.session_id ? ` | ${t("activeLabel")}` : "";
-    const subtitle = `${formatTimestamp(entry.created_at)} | ${entry.doc_language} | ${entry.chunk_count} chunks${activeTag}`;
+    const subtitle = `${formatTimestamp(entry.created_at)} | ${entry.doc_language} | ${entry.chunk_count} chunks | cs=${entry.chunk_size}, ov=${entry.chunk_overlap}${activeTag}`;
     const lines = [`${t("filesLabel")}: ${files.join(", ") || "-"}`];
 
     const item = createHistoryItem(title, subtitle, lines);
@@ -486,6 +677,10 @@ async function syncHealth() {
     const data = await response.json();
     metricLanguage.textContent = data.doc_language;
     metricChunks.textContent = String(data.chunk_count);
+    metricChunkSize.textContent = String(data.chunk_size || 1500);
+    metricChunkOverlap.textContent = String(data.chunk_overlap || 100);
+    chunkSizeSelect.value = String(data.chunk_size || 1500);
+    chunkOverlapSelect.value = String(data.chunk_overlap || 100);
     hasIndexedData = Boolean(data.indexed);
 
     if (data.indexed) {
@@ -526,6 +721,8 @@ async function buildIndex(event) {
     formData.append("files", file);
   }
   formData.append("ollama_model", modelSelect.value);
+  formData.append("chunk_size", chunkSizeSelect.value);
+  formData.append("chunk_overlap", chunkOverlapSelect.value);
 
   try {
     const response = await fetch("/api/build-index", {
@@ -540,6 +737,10 @@ async function buildIndex(event) {
 
     metricLanguage.textContent = data.doc_language;
     metricChunks.textContent = String(data.chunk_count);
+    metricChunkSize.textContent = String(data.chunk_size);
+    metricChunkOverlap.textContent = String(data.chunk_overlap);
+    chunkSizeSelect.value = String(data.chunk_size);
+    chunkOverlapSelect.value = String(data.chunk_overlap);
     buildStatus.textContent = t("statusBuildSuccess");
     setAskStatus(t("statusReadyToAsk"), false);
     chat.innerHTML = "";
@@ -600,6 +801,65 @@ function clearChat() {
   setAskStatus(t("statusChatCleared"), false);
 }
 
+async function clearHistory() {
+  const targetSessionId = activeSessionId || latestSessionId;
+  if (!targetSessionId) {
+    setAskStatus(t("statusNoSessionToClear"), false);
+    return;
+  }
+
+  if (!window.confirm(t("confirmClearHistory"))) {
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/history?session_id=${targetSessionId}`, { method: "DELETE" });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || t("statusFailed"));
+    }
+
+    if (activeSessionId === targetSessionId) {
+      chat.innerHTML = "";
+    }
+    setAskStatus(t("statusHistoryCleared"), false);
+    loadHistory();
+  } catch (error) {
+    setAskStatus(error.message, false);
+  }
+}
+
+async function clearVectorStore() {
+  if (!window.confirm(t("confirmClearVectorStore"))) {
+    return;
+  }
+
+  try {
+    const response = await fetch("/api/vector-store", { method: "DELETE" });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || t("statusFailed"));
+    }
+
+    activeSessionId = null;
+    hasIndexedData = false;
+    chat.innerHTML = "";
+    metricLanguage.textContent = "unknown";
+    metricChunks.textContent = "0";
+    metricChunkSize.textContent = "1500";
+    metricChunkOverlap.textContent = "100";
+    chunkSizeSelect.value = "1500";
+    chunkOverlapSelect.value = "100";
+    document.getElementById("pdf-files").value = "";
+    setSystemStatus(true, t("systemReady"));
+    buildStatus.textContent = t("statusVectorStoreCleared");
+    setAskStatus(t("statusVectorStoreCleared"), false);
+    loadHistory();
+  } catch (error) {
+    setAskStatus(error.message, false);
+  }
+}
+
 function fillSuggestedQuestion(event) {
   const text = event.currentTarget.dataset.question || event.currentTarget.dataset.questionVi || "";
   questionInput.value = text;
@@ -615,6 +875,8 @@ function handleLanguageChange(event) {
 }
 
 clearChatButton.addEventListener("click", clearChat);
+clearHistoryButton.addEventListener("click", clearHistory);
+clearVectorStoreButton.addEventListener("click", clearVectorStore);
 refreshHistoryButton.addEventListener("click", loadHistory);
 historyToggleButton.addEventListener("click", () => {
   setHistoryCollapsed(!isHistoryCollapsed);
@@ -625,14 +887,23 @@ openGuideButton.addEventListener("click", () => {
   setGuideVisible(true);
 });
 closeGuideButton.addEventListener("click", dismissGuide);
+citationCloseButton.addEventListener("click", closeCitationModal);
 guidePopup.addEventListener("click", (event) => {
   if (event.target === guidePopup) {
     dismissGuide();
   }
 });
+citationModal.addEventListener("click", (event) => {
+  if (event.target === citationModal) {
+    closeCitationModal();
+  }
+});
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && guidePopup.classList.contains("show")) {
     dismissGuide();
+  }
+  if (event.key === "Escape" && citationModal.classList.contains("show")) {
+    closeCitationModal();
   }
 });
 languageSelect.addEventListener("change", handleLanguageChange);
