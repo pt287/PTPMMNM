@@ -36,6 +36,23 @@ const metricLanguage = document.getElementById("metric-language");
 const metricChunks = document.getElementById("metric-chunks");
 const metricChunkSize = document.getElementById("metric-chunk-size");
 const metricChunkOverlap = document.getElementById("metric-chunk-overlap");
+const metricReranking = document.getElementById("metric-reranking");
+const useRerankingCheckbox = document.getElementById("use-reranking");
+const rerankerModelSelect = document.getElementById("reranker-model");
+const rerankTopNSelect = document.getElementById("rerank-top-n");
+const rerankerModelLabel = document.getElementById("reranker-model-label");
+const rerankTopNLabel = document.getElementById("rerank-top-n-label");
+
+const metricSelfRag = document.getElementById("metric-self-rag");
+const useSelfRagCheckbox = document.getElementById("use-self-rag");
+const enableQueryRewritingCheckbox = document.getElementById("enable-query-rewriting");
+const enableMultiHopCheckbox = document.getElementById("enable-multi-hop");
+const maxHopsSelect = document.getElementById("max-hops");
+const confidenceThresholdSelect = document.getElementById("confidence-threshold");
+const queryRewritingLabel = document.getElementById("query-rewriting-label");
+const multiHopLabel = document.getElementById("multi-hop-label");
+const maxHopsLabel = document.getElementById("max-hops-label");
+const confidenceThresholdLabel = document.getElementById("confidence-threshold-label");
 
 const translations = {
   vi: {
@@ -54,6 +71,16 @@ const translations = {
     metricChunks: "Số chunk",
     metricChunkSize: "Chunk size",
     metricChunkOverlap: "Chunk overlap",
+    metricReranking: "Re-ranking",
+    useRerankingLabel: "Bật Re-ranking (Cross-Encoder)",
+    rerankerModelLabel: "Re-ranker Model",
+    rerankTopNLabel: "Re-rank Top N candidates",
+    metricSelfRag: "Self-RAG",
+    useSelfRagLabel: "Bật Self-RAG (Tự đánh giá)",
+    enableQueryRewritingLabel: "Query Rewriting (Cải thiện câu hỏi)",
+    enableMultiHopLabel: "Multi-hop Reasoning (Suy luận nhiều bước)",
+    maxHopsLabel: "Max Hops",
+    confidenceThresholdLabel: "Confidence Threshold",
     sectionConfigTitle: "1. Tài liệu",
     sectionConfigDesc: "Dành cho bài tập, báo cáo, quy trình nghiệp vụ, tài liệu họp.",
     pdfLabel: "Chọn file PDF/DOCX",
@@ -137,6 +164,16 @@ const translations = {
     metricChunks: "Chunks",
     metricChunkSize: "Chunk size",
     metricChunkOverlap: "Chunk overlap",
+    metricReranking: "Re-ranking",
+    useRerankingLabel: "Enable Re-ranking (Cross-Encoder)",
+    rerankerModelLabel: "Re-ranker Model",
+    rerankTopNLabel: "Re-rank Top N candidates",
+    metricSelfRag: "Self-RAG",
+    useSelfRagLabel: "Enable Self-RAG (Self-Evaluation)",
+    enableQueryRewritingLabel: "Query Rewriting (Improve Question)",
+    enableMultiHopLabel: "Multi-hop Reasoning",
+    maxHopsLabel: "Max Hops",
+    confidenceThresholdLabel: "Confidence Threshold",
     sectionConfigTitle: "1. Documents",
     sectionConfigDesc: "Great for homework, reports, business workflows, and meeting docs.",
     pdfLabel: "Select PDF/DOCX files",
@@ -679,6 +716,9 @@ async function syncHealth() {
     metricChunks.textContent = String(data.chunk_count);
     metricChunkSize.textContent = String(data.chunk_size || 1500);
     metricChunkOverlap.textContent = String(data.chunk_overlap || 100);
+    metricReranking.textContent = data.use_reranking
+      ? (currentLanguage === "vi" ? "Bật" : "On")
+      : (currentLanguage === "vi" ? "Tắt" : "Off");
     chunkSizeSelect.value = String(data.chunk_size || 1500);
     chunkOverlapSelect.value = String(data.chunk_overlap || 100);
     hasIndexedData = Boolean(data.indexed);
@@ -723,6 +763,14 @@ async function buildIndex(event) {
   formData.append("ollama_model", modelSelect.value);
   formData.append("chunk_size", chunkSizeSelect.value);
   formData.append("chunk_overlap", chunkOverlapSelect.value);
+  formData.append("use_reranking", useRerankingCheckbox.checked);
+  formData.append("reranker_model", rerankerModelSelect.value);
+  formData.append("rerank_top_n", rerankTopNSelect.value);
+  formData.append("use_self_rag", useSelfRagCheckbox.checked);
+  formData.append("enable_query_rewriting", enableQueryRewritingCheckbox.checked);
+  formData.append("enable_multi_hop", enableMultiHopCheckbox.checked);
+  formData.append("max_hops", maxHopsSelect.value);
+  formData.append("confidence_threshold", confidenceThresholdSelect.value);
 
   try {
     const response = await fetch("/api/build-index", {
@@ -739,6 +787,12 @@ async function buildIndex(event) {
     metricChunks.textContent = String(data.chunk_count);
     metricChunkSize.textContent = String(data.chunk_size);
     metricChunkOverlap.textContent = String(data.chunk_overlap);
+    metricReranking.textContent = data.use_reranking
+      ? (currentLanguage === "vi" ? "Bật" : "On")
+      : (currentLanguage === "vi" ? "Tắt" : "Off");
+    metricSelfRag.textContent = data.use_self_rag
+      ? (currentLanguage === "vi" ? "Bật" : "On")
+      : (currentLanguage === "vi" ? "Tắt" : "Off");
     chunkSizeSelect.value = String(data.chunk_size);
     chunkOverlapSelect.value = String(data.chunk_overlap);
     buildStatus.textContent = t("statusBuildSuccess");
@@ -787,7 +841,33 @@ async function askQuestion(event) {
       throw new Error(data.detail || t("statusAskError"));
     }
 
-    addMessage("assistant", `${data.answer}\n\n${t("responseTime")}: ${data.response_time}s`, data.sources);
+    let messageText = `${data.answer}\n\n${t("responseTime")}: ${data.response_time}s`;
+
+    // Add Self-RAG metadata if available
+    if (data.self_rag_metadata) {
+      const meta = data.self_rag_metadata;
+      messageText += "\n\n📊 Self-RAG Metadata:";
+
+      if (meta.query_rewrite && meta.query_rewrite.used_rewriting) {
+        messageText += `\n• Original query: "${meta.query_rewrite.original}"`;
+        messageText += `\n• Rewritten query: "${meta.query_rewrite.rewritten}"`;
+      }
+
+      if (meta.evaluation) {
+        const evaluation = meta.evaluation;
+        messageText += `\n• Confidence: ${(evaluation.confidence * 100).toFixed(1)}%`;
+        messageText += `\n• Grounding: ${evaluation.grounding_score}/10`;
+        messageText += `\n• Relevance: ${evaluation.relevance_score}/10`;
+        messageText += `\n• Completeness: ${evaluation.completeness_score}/10`;
+        messageText += `\n• Status: ${evaluation.passed ? "✓ Passed" : "⚠ Low confidence"}`;
+      }
+
+      if (meta.multi_hop && meta.multi_hop.total_hops > 1) {
+        messageText += `\n• Multi-hop: ${meta.multi_hop.total_hops} hops (${meta.multi_hop.completed ? "completed" : "incomplete"})`;
+      }
+    }
+
+    addMessage("assistant", messageText, data.sources);
     setAskStatus(t("statusDone"), false);
     loadHistory();
   } catch (error) {
@@ -912,10 +992,32 @@ suggestionButtons.forEach((button) => {
   button.addEventListener("click", fillSuggestedQuestion);
 });
 
+// Toggle re-ranker options visibility
+function toggleRerankingOptions() {
+  const isEnabled = useRerankingCheckbox.checked;
+  rerankerModelLabel.style.display = isEnabled ? "" : "none";
+  rerankTopNLabel.style.display = isEnabled ? "" : "none";
+}
+
+useRerankingCheckbox.addEventListener("change", toggleRerankingOptions);
+
+// Toggle Self-RAG options visibility
+function toggleSelfRagOptions() {
+  const isEnabled = useSelfRagCheckbox.checked;
+  queryRewritingLabel.style.display = isEnabled ? "" : "none";
+  multiHopLabel.style.display = isEnabled ? "" : "none";
+  maxHopsLabel.style.display = isEnabled ? "" : "none";
+  confidenceThresholdLabel.style.display = isEnabled ? "" : "none";
+}
+
+useSelfRagCheckbox.addEventListener("change", toggleSelfRagOptions);
+
 languageSelect.value = currentLanguage;
 setHistoryCollapsed(isHistoryCollapsed);
 applyTranslations();
 setGuideVisible(!isGuideDismissed);
+toggleRerankingOptions(); // Initialize visibility
+toggleSelfRagOptions(); // Initialize visibility
 buildForm.addEventListener("submit", buildIndex);
 askForm.addEventListener("submit", askQuestion);
 setAskStatus("", false);

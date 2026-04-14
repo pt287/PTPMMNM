@@ -190,6 +190,28 @@ body {
   align-content: start;
 }
 
+.build-form .checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 4px;
+  cursor: pointer;
+}
+
+.build-form .checkbox-label input[type="checkbox"] {
+  cursor: pointer;
+  width: 18px;
+  height: 18px;
+}
+
+.build-form .reranker-option {
+  display: none;
+}
+
+.build-form .self-rag-option {
+  display: none;
+}
+
 .workflow-card {
   padding: 12px;
   align-self: start;

@@ -12,7 +12,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from rag_engine import RAGConfig, ask_question, build_rag_pipeline
+from rag_engine import (
+    RAGConfig,
+    ask_question,
+    ask_question_with_self_rag,
+    build_rag_pipeline,
+    compare_retrieval_methods,
+)
 
 
 class AskPayload(BaseModel):
@@ -38,6 +44,17 @@ class AppState:
         self.chunk_overlap = 100
         self.current_session_id: Optional[int] = None
         self.conversation_history: List[tuple[str, str]] = []
+        self.use_reranking = False
+        self.reranker_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        self.rerank_top_n = 10
+
+        # Self-RAG state
+        self.use_self_rag = False
+        self.enable_query_rewriting = False
+        self.enable_multi_hop = False
+        self.max_hops = 3
+        self.confidence_threshold = 0.7
+        self.vectorstore = None  # Store vectorstore for Self-RAG
 
 
 state = AppState()
@@ -111,6 +128,23 @@ def _init_db() -> None:
                 conn.execute("ALTER TABLE index_sessions ADD COLUMN chunk_size INTEGER NOT NULL DEFAULT 1500")
             if "chunk_overlap" not in session_columns:
                 conn.execute("ALTER TABLE index_sessions ADD COLUMN chunk_overlap INTEGER NOT NULL DEFAULT 100")
+            if "use_reranking" not in session_columns:
+                conn.execute("ALTER TABLE index_sessions ADD COLUMN use_reranking INTEGER NOT NULL DEFAULT 0")
+            if "reranker_model" not in session_columns:
+                conn.execute("ALTER TABLE index_sessions ADD COLUMN reranker_model TEXT")
+            if "rerank_top_n" not in session_columns:
+                conn.execute("ALTER TABLE index_sessions ADD COLUMN rerank_top_n INTEGER NOT NULL DEFAULT 10")
+            # Self-RAG columns
+            if "use_self_rag" not in session_columns:
+                conn.execute("ALTER TABLE index_sessions ADD COLUMN use_self_rag INTEGER NOT NULL DEFAULT 0")
+            if "enable_query_rewriting" not in session_columns:
+                conn.execute("ALTER TABLE index_sessions ADD COLUMN enable_query_rewriting INTEGER NOT NULL DEFAULT 0")
+            if "enable_multi_hop" not in session_columns:
+                conn.execute("ALTER TABLE index_sessions ADD COLUMN enable_multi_hop INTEGER NOT NULL DEFAULT 0")
+            if "max_hops" not in session_columns:
+                conn.execute("ALTER TABLE index_sessions ADD COLUMN max_hops INTEGER NOT NULL DEFAULT 3")
+            if "confidence_threshold" not in session_columns:
+                conn.execute("ALTER TABLE index_sessions ADD COLUMN confidence_threshold REAL NOT NULL DEFAULT 0.7")
             conn.commit()
 
 
@@ -146,6 +180,14 @@ def _store_index_session(
     ollama_model: str,
     embedding_model: str,
     temperature: float,
+    use_reranking: bool,
+    reranker_model: str,
+    rerank_top_n: int,
+    use_self_rag: bool,
+    enable_query_rewriting: bool,
+    enable_multi_hop: bool,
+    max_hops: int,
+    confidence_threshold: float,
     files: List[Dict[str, Any]],
 ) -> int:
     with db_lock:
@@ -153,8 +195,10 @@ def _store_index_session(
             cursor = conn.execute(
                 """
                 INSERT INTO index_sessions (
-                    doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature,
+                    use_reranking, reranker_model, rerank_top_n,
+                    use_self_rag, enable_query_rewriting, enable_multi_hop, max_hops, confidence_threshold
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     doc_language,
@@ -164,6 +208,14 @@ def _store_index_session(
                     ollama_model,
                     embedding_model,
                     temperature,
+                    1 if use_reranking else 0,
+                    reranker_model if use_reranking else None,
+                    rerank_top_n,
+                    1 if use_self_rag else 0,
+                    1 if enable_query_rewriting else 0,
+                    1 if enable_multi_hop else 0,
+                    max_hops,
+                    confidence_threshold,
                 ),
             )
             session_id = int(cursor.lastrowid)
@@ -217,7 +269,9 @@ def _fetch_upload_history(limit: int) -> List[Dict[str, Any]]:
         with _get_connection() as conn:
             sessions = conn.execute(
                 """
-                SELECT id, created_at, doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature
+                SELECT id, created_at, doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature,
+                       use_reranking, reranker_model, rerank_top_n,
+                       use_self_rag, enable_query_rewriting, enable_multi_hop, max_hops, confidence_threshold
                 FROM index_sessions
                 ORDER BY id DESC
                 LIMIT ?
@@ -253,6 +307,14 @@ def _fetch_upload_history(limit: int) -> List[Dict[str, Any]]:
                         "ollama_model": row["ollama_model"],
                         "embedding_model": row["embedding_model"],
                         "temperature": row["temperature"],
+                        "use_reranking": bool(row["use_reranking"]),
+                        "reranker_model": row["reranker_model"],
+                        "rerank_top_n": row["rerank_top_n"],
+                        "use_self_rag": bool(row["use_self_rag"]),
+                        "enable_query_rewriting": bool(row["enable_query_rewriting"]),
+                        "enable_multi_hop": bool(row["enable_multi_hop"]),
+                        "max_hops": row["max_hops"],
+                        "confidence_threshold": row["confidence_threshold"],
                         "pdf_files": pdf_files,
                     }
                 )
@@ -407,7 +469,9 @@ def _fetch_session_info(session_id: int) -> Optional[Dict[str, Any]]:
         with _get_connection() as conn:
             row = conn.execute(
                 """
-                SELECT id, created_at, doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature
+                SELECT id, created_at, doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature,
+                       use_reranking, reranker_model, rerank_top_n,
+                       use_self_rag, enable_query_rewriting, enable_multi_hop, max_hops, confidence_threshold
                 FROM index_sessions
                 WHERE id = ?
                 """,
@@ -427,6 +491,14 @@ def _fetch_session_info(session_id: int) -> Optional[Dict[str, Any]]:
         "ollama_model": row["ollama_model"],
         "embedding_model": row["embedding_model"],
         "temperature": row["temperature"],
+        "use_reranking": bool(row["use_reranking"]),
+        "reranker_model": row["reranker_model"],
+        "rerank_top_n": row["rerank_top_n"],
+        "use_self_rag": bool(row["use_self_rag"]),
+        "enable_query_rewriting": bool(row["enable_query_rewriting"]),
+        "enable_multi_hop": bool(row["enable_multi_hop"]),
+        "max_hops": row["max_hops"],
+        "confidence_threshold": row["confidence_threshold"],
     }
 
 
@@ -488,6 +560,14 @@ def health() -> dict:
         "chunk_count": state.chunk_count,
         "chunk_size": state.chunk_size,
         "chunk_overlap": state.chunk_overlap,
+        "use_reranking": state.use_reranking,
+        "reranker_model": state.reranker_model,
+        "rerank_top_n": state.rerank_top_n,
+        "use_self_rag": state.use_self_rag,
+        "enable_query_rewriting": state.enable_query_rewriting,
+        "enable_multi_hop": state.enable_multi_hop,
+        "max_hops": state.max_hops,
+        "confidence_threshold": state.confidence_threshold,
     }
 
 
@@ -517,6 +597,9 @@ def session_history(session_id: int, limit: int = 30) -> dict:
             "chunk_count": session["chunk_count"],
             "chunk_size": session["chunk_size"],
             "chunk_overlap": session["chunk_overlap"],
+            "use_reranking": session["use_reranking"],
+            "reranker_model": session["reranker_model"],
+            "rerank_top_n": session["rerank_top_n"],
             "pdf_files": [
                 {"file_name": item["file_name"], "file_size": item["file_size"]}
                 for item in files
@@ -568,6 +651,14 @@ def activate_session(session_id: int) -> dict:
         chunk_overlap=session["chunk_overlap"],
         top_k=3,
         temperature=session["temperature"],
+        use_reranking=session["use_reranking"],
+        reranker_model=session["reranker_model"] or "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        rerank_top_n=session["rerank_top_n"],
+        use_self_rag=session["use_self_rag"],
+        enable_query_rewriting=session["enable_query_rewriting"],
+        enable_multi_hop=session["enable_multi_hop"],
+        max_hops=session["max_hops"],
+        confidence_threshold=session["confidence_threshold"],
     )
 
     try:
@@ -580,6 +671,17 @@ def activate_session(session_id: int) -> dict:
     state.chunk_count = chunk_count
     state.chunk_size = session["chunk_size"]
     state.chunk_overlap = session["chunk_overlap"]
+    state.use_reranking = session["use_reranking"]
+    state.reranker_model = session["reranker_model"] or "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    state.rerank_top_n = session["rerank_top_n"]
+    state.use_self_rag = session["use_self_rag"]
+    state.enable_query_rewriting = session["enable_query_rewriting"]
+    state.enable_multi_hop = session["enable_multi_hop"]
+    state.max_hops = session["max_hops"]
+    state.confidence_threshold = session["confidence_threshold"]
+    # Store vectorstore for Self-RAG
+    if hasattr(qa_chain.retriever, 'vectorstore'):
+        state.vectorstore = qa_chain.retriever.vectorstore
     state.current_session_id = session_id
     state.conversation_history = []
 
@@ -590,6 +692,9 @@ def activate_session(session_id: int) -> dict:
         "chunk_count": chunk_count,
         "chunk_size": session["chunk_size"],
         "chunk_overlap": session["chunk_overlap"],
+        "use_reranking": session["use_reranking"],
+        "reranker_model": session["reranker_model"],
+        "rerank_top_n": session["rerank_top_n"],
     }
 
 
@@ -619,6 +724,15 @@ async def build_index(
     chunk_size: int = Form(1500),
     chunk_overlap: int = Form(100),
     temperature: float = Form(0.1),
+    use_reranking: bool = Form(False),
+    reranker_model: str = Form("cross-encoder/ms-marco-MiniLM-L-6-v2"),
+    rerank_top_n: int = Form(10),
+    # Self-RAG parameters
+    use_self_rag: bool = Form(False),
+    enable_query_rewriting: bool = Form(False),
+    enable_multi_hop: bool = Form(False),
+    max_hops: int = Form(3),
+    confidence_threshold: float = Form(0.7),
 ) -> dict:
     if not files:
         raise HTTPException(status_code=400, detail="Please upload at least one PDF or DOCX file.")
@@ -656,6 +770,15 @@ async def build_index(
         chunk_overlap=chunk_overlap,
         top_k=3,
         temperature=temperature,
+        use_reranking=use_reranking,
+        reranker_model=reranker_model,
+        rerank_top_n=rerank_top_n,
+        # Self-RAG
+        use_self_rag=use_self_rag,
+        enable_query_rewriting=enable_query_rewriting,
+        enable_multi_hop=enable_multi_hop,
+        max_hops=max_hops,
+        confidence_threshold=confidence_threshold,
     )
 
     try:
@@ -668,6 +791,18 @@ async def build_index(
     state.chunk_count = chunk_count
     state.chunk_size = chunk_size
     state.chunk_overlap = chunk_overlap
+    state.use_reranking = use_reranking
+    state.reranker_model = reranker_model
+    state.rerank_top_n = rerank_top_n
+    # Self-RAG state
+    state.use_self_rag = use_self_rag
+    state.enable_query_rewriting = enable_query_rewriting
+    state.enable_multi_hop = enable_multi_hop
+    state.max_hops = max_hops
+    state.confidence_threshold = confidence_threshold
+    # Store vectorstore for Self-RAG
+    if hasattr(qa_chain.retriever, 'vectorstore'):
+        state.vectorstore = qa_chain.retriever.vectorstore
     state.conversation_history = []
     state.current_session_id = _store_index_session(
         doc_language=doc_language,
@@ -677,6 +812,14 @@ async def build_index(
         ollama_model=ollama_model,
         embedding_model=embedding_model,
         temperature=temperature,
+        use_reranking=use_reranking,
+        reranker_model=reranker_model,
+        rerank_top_n=rerank_top_n,
+        use_self_rag=use_self_rag,
+        enable_query_rewriting=enable_query_rewriting,
+        enable_multi_hop=enable_multi_hop,
+        max_hops=max_hops,
+        confidence_threshold=confidence_threshold,
         files=file_records,
     )
 
@@ -686,6 +829,14 @@ async def build_index(
         "chunk_count": chunk_count,
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
+        "use_reranking": use_reranking,
+        "reranker_model": reranker_model if use_reranking else None,
+        "rerank_top_n": rerank_top_n if use_reranking else None,
+        "use_self_rag": use_self_rag,
+        "enable_query_rewriting": enable_query_rewriting if use_self_rag else None,
+        "enable_multi_hop": enable_multi_hop if use_self_rag else None,
+        "max_hops": max_hops if use_self_rag else None,
+        "confidence_threshold": confidence_threshold if use_self_rag else None,
         "session_id": state.current_session_id,
     }
 
@@ -701,11 +852,36 @@ def ask(payload: AskPayload) -> dict:
 
     start = time.time()
     try:
-        answer, sources = ask_question(
-            state.qa_chain,
-            question,
-            conversation_history=state.conversation_history,
-        )
+        # Use Self-RAG if enabled
+        if state.use_self_rag and state.vectorstore is not None:
+            # Create config for Self-RAG
+            self_rag_config = RAGConfig(
+                use_self_rag=state.use_self_rag,
+                enable_query_rewriting=state.enable_query_rewriting,
+                enable_multi_hop=state.enable_multi_hop,
+                max_hops=state.max_hops,
+                confidence_threshold=state.confidence_threshold,
+                top_k=3,
+                use_reranking=state.use_reranking,
+                reranker_model=state.reranker_model,
+                rerank_top_n=state.rerank_top_n,
+            )
+
+            answer, sources, metadata = ask_question_with_self_rag(
+                state.qa_chain,
+                question,
+                state.vectorstore,
+                self_rag_config,
+                conversation_history=state.conversation_history,
+            )
+        else:
+            # Standard RAG
+            answer, sources = ask_question(
+                state.qa_chain,
+                question,
+                conversation_history=state.conversation_history,
+            )
+            metadata = None
     except Exception as exc:
         detail = str(exc)
         if "requires more system memory" in detail.lower():
@@ -748,10 +924,81 @@ def ask(payload: AskPayload) -> dict:
         response_time=response_time,
     )
 
-    return {
+    response = {
         "answer": answer,
         "sources": sources,
         "response_time": response_time,
+    }
+
+    # Add Self-RAG metadata if available
+    if state.use_self_rag and metadata is not None:
+        response["self_rag_metadata"] = metadata
+
+    return response
+
+
+@app.post("/api/compare-retrieval")
+def compare_retrieval(payload: AskPayload) -> dict:
+    """Compare bi-encoder vs cross-encoder retrieval methods."""
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    if state.qa_chain is None:
+        raise HTTPException(status_code=400, detail="Build RAG index before comparing retrieval methods.")
+
+    # Get vectorstore from retriever
+    if hasattr(state.qa_chain.retriever, 'vectorstore'):
+        vectorstore = state.qa_chain.retriever.vectorstore
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail="Cannot access vectorstore from current QA chain configuration."
+        )
+
+    # Create config for comparison
+    config = RAGConfig(
+        top_k=3,
+        use_reranking=True,
+        reranker_model=state.reranker_model,
+        rerank_top_n=state.rerank_top_n,
+    )
+
+    try:
+        comparison = compare_retrieval_methods(vectorstore, question, config)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    # Format documents for response
+    def format_docs(docs):
+        result = []
+        for doc in docs:
+            metadata = doc.metadata or {}
+            result.append({
+                "chunk_id": metadata.get("chunk_id", "?"),
+                "source": metadata.get("source", "unknown"),
+                "page": metadata.get("page", "?"),
+                "preview": doc.page_content[:200].replace("\n", " ") + "...",
+            })
+        return result
+
+    return {
+        "query": question,
+        "bi_encoder": {
+            "time_ms": comparison["bi_encoder"]["time_ms"],
+            "num_docs": comparison["bi_encoder"]["num_docs"],
+            "documents": format_docs(comparison["bi_encoder"]["docs"]),
+        },
+        "cross_encoder": {
+            "time_ms": comparison["cross_encoder"]["time_ms"],
+            "retrieval_time_ms": comparison["cross_encoder"]["retrieval_time_ms"],
+            "rerank_time_ms": comparison["cross_encoder"]["rerank_time_ms"],
+            "num_candidates": comparison["cross_encoder"]["num_candidates"],
+            "num_final": comparison["cross_encoder"]["num_final"],
+            "documents": format_docs(comparison["cross_encoder"]["docs"]),
+            "scores": comparison["cross_encoder"]["scores"],
+        },
+        "comparison": comparison["comparison"],
     }
 
 

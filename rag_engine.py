@@ -9,16 +9,19 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from langchain.chains import RetrievalQA
+from langchain_classic.chains import RetrievalQA
 from langchain_core.documents import Document
-from langchain.prompts import PromptTemplate
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.prompts import PromptTemplate
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PDFPlumberLoader
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaLLM
 from langdetect import LangDetectException, detect
 from docx import Document as DocxDocument
+from sentence_transformers import CrossEncoder
 
 
 @dataclass
@@ -32,6 +35,17 @@ class RAGConfig:
     num_ctx: int = 1536
     num_predict: int = 220
     num_gpu: int = 0
+    # Re-ranking configuration
+    use_reranking: bool = False
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_top_n: int = 10  # Retrieve more candidates for re-ranking
+
+    # Self-RAG configuration
+    use_self_rag: bool = False
+    enable_query_rewriting: bool = False
+    enable_multi_hop: bool = False
+    max_hops: int = 3  # Maximum retrieval iterations
+    confidence_threshold: float = 0.7  # Minimum confidence to accept answer
 
 
 def _validate_config(config: RAGConfig) -> None:
@@ -193,6 +207,83 @@ def _get_embeddings(model_name: str) -> HuggingFaceEmbeddings:
     )
 
 
+@lru_cache(maxsize=2)
+def _get_cross_encoder(model_name: str) -> CrossEncoder:
+    """Cache cross-encoder model instance to avoid cold-loading."""
+    return CrossEncoder(model_name, max_length=512)
+
+
+class RerankingRetriever(BaseRetriever):
+    """Custom retriever that performs re-ranking with a cross-encoder."""
+
+    vectorstore: FAISS
+    config: RAGConfig
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: Optional[CallbackManagerForRetrieverRun] = None
+    ) -> List[Document]:
+        """Retrieve documents with optional re-ranking."""
+        # Retrieve more candidates if re-ranking is enabled
+        k = self.config.rerank_top_n if self.config.use_reranking else self.config.top_k
+
+        # Get initial candidates using bi-encoder (FAISS)
+        initial_docs = self.vectorstore.similarity_search(query, k=k)
+
+        if not self.config.use_reranking or not initial_docs:
+            return initial_docs[: self.config.top_k]
+
+        # Re-rank using cross-encoder
+        reranked_docs = rerank_documents(query, initial_docs, self.config)
+        return reranked_docs
+
+
+def rerank_documents(
+    query: str,
+    documents: List[Document],
+    config: RAGConfig,
+    return_scores: bool = False,
+) -> List[Document] | Tuple[List[Document], List[float]]:
+    """
+    Re-rank documents using a cross-encoder model.
+
+    Args:
+        query: User query text
+        documents: List of documents to re-rank
+        config: RAG configuration with re-ranker settings
+        return_scores: If True, return (documents, scores) tuple
+
+    Returns:
+        Re-ranked documents (and scores if return_scores=True)
+    """
+    if not documents:
+        return ([], []) if return_scores else []
+
+    # Get cross-encoder model
+    cross_encoder = _get_cross_encoder(config.reranker_model)
+
+    # Prepare query-document pairs for scoring
+    pairs = [[query, doc.page_content] for doc in documents]
+
+    # Get relevance scores (higher is better)
+    scores = cross_encoder.predict(pairs)
+
+    # Sort documents by scores in descending order
+    doc_score_pairs = list(zip(documents, scores))
+    doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
+
+    # Return top_k documents
+    top_k = min(config.top_k, len(documents))
+    reranked_docs = [doc for doc, _ in doc_score_pairs[:top_k]]
+    reranked_scores = [float(score) for _, score in doc_score_pairs[:top_k]]
+
+    if return_scores:
+        return reranked_docs, reranked_scores
+    return reranked_docs
+
+
 def build_vectorstore(chunks, config: RAGConfig) -> FAISS:
     if not chunks:
         raise ValueError("Không có chunks để tạo FAISS index.")
@@ -236,10 +327,16 @@ def build_qa_chain(vectorstore: FAISS, config: RAGConfig) -> RetrievalQA:
     )
     prompt = _build_prompt()
 
+    # Use custom re-ranking retriever if enabled, otherwise use default FAISS retriever
+    if config.use_reranking:
+        retriever = RerankingRetriever(vectorstore=vectorstore, config=config)
+    else:
+        retriever = vectorstore.as_retriever(search_kwargs={"k": config.top_k})
+
     return RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        retriever=vectorstore.as_retriever(search_kwargs={"k": config.top_k}),
+        retriever=retriever,
         return_source_documents=True,
         chain_type_kwargs={"prompt": prompt},
     )
@@ -312,6 +409,478 @@ def _build_highlight_text(text: str, max_chars: int = 260) -> str:
     if len(cleaned) <= max_chars:
         return cleaned
     return cleaned[:max_chars].rstrip() + "..."
+
+
+def _extract_llm_from_qa_chain(qa_chain: RetrievalQA) -> OllamaLLM:
+    """Resolve the underlying LLM from RetrievalQA across chain layouts."""
+
+    combine_chain = getattr(qa_chain, "combine_documents_chain", None)
+    if combine_chain is not None:
+        llm_chain = getattr(combine_chain, "llm_chain", None)
+        llm = getattr(llm_chain, "llm", None) if llm_chain is not None else None
+        if llm is not None:
+            return llm
+
+        # Fallback for older/alternative chain objects.
+        llm = getattr(combine_chain, "llm", None)
+        if llm is not None:
+            return llm
+
+    qa_llm_chain = getattr(qa_chain, "llm_chain", None)
+    llm = getattr(qa_llm_chain, "llm", None) if qa_llm_chain is not None else None
+    if llm is not None:
+        return llm
+
+    llm = getattr(qa_chain, "llm", None)
+    if llm is not None:
+        return llm
+
+    raise AttributeError(
+        "Unable to resolve LLM from RetrievalQA; expected "
+        "`qa_chain.combine_documents_chain.llm_chain.llm` for stuff chains."
+    )
+
+
+def _retrieve_documents(retriever: Any, query: str) -> List[Document]:
+    """Retrieve documents with compatibility for classic and runnable retrievers."""
+
+    if hasattr(retriever, "invoke"):
+        docs = retriever.invoke(query)
+        return list(docs or [])
+
+    if hasattr(retriever, "get_relevant_documents"):
+        return retriever.get_relevant_documents(query)
+
+    raise AttributeError("Retriever does not support `invoke` or `get_relevant_documents`.")
+
+
+def rewrite_query(
+    original_query: str,
+    llm: OllamaLLM,
+    language: str = "vi",
+) -> Dict[str, Any]:
+    """
+    Rewrite user query để cải thiện retrieval quality.
+
+    Strategies:
+    1. Expand với keywords liên quan
+    2. Rephrase cho rõ ràng hơn
+    3. Break down complex queries
+
+    Returns:
+        Dict với original query, rewritten query, và metadata
+    """
+
+    prompt_template = """
+Bạn là chuyên gia phân tích câu hỏi. Nhiệm vụ của bạn là cải thiện câu hỏi để tìm kiếm tài liệu chính xác hơn.
+
+Câu hỏi gốc: {query}
+
+Hãy viết lại câu hỏi này theo các cách sau:
+1. Thêm từ khóa liên quan (synonyms, related terms)
+2. Làm rõ ý định của câu hỏi
+3. Nếu câu hỏi phức tạp, chia nhỏ thành các sub-questions
+
+Chỉ trả về câu hỏi đã được cải thiện, không giải thích.
+
+Câu hỏi cải thiện:
+""".strip()
+
+    try:
+        prompt = prompt_template.format(query=original_query)
+        rewritten = llm.invoke(prompt).strip()
+
+        return {
+            "original": original_query,
+            "rewritten": rewritten,
+            "used_rewriting": True,
+            "language": language,
+        }
+    except Exception:
+        # Fallback to original query
+        return {
+            "original": original_query,
+            "rewritten": original_query,
+            "used_rewriting": False,
+            "language": language,
+        }
+
+
+def evaluate_answer_quality(
+    question: str,
+    answer: str,
+    context_documents: List[Document],
+    llm: OllamaLLM,
+) -> Dict[str, Any]:
+    """
+    Self-RAG: LLM tự đánh giá chất lượng câu trả lời.
+
+    Evaluation criteria:
+    1. Grounding: Câu trả lời có dựa trên context không?
+    2. Relevance: Câu trả lời có trả lời đúng câu hỏi không?
+    3. Completeness: Câu trả lời có đầy đủ không?
+
+    Returns:
+        Dict với scores và critique
+    """
+
+    # Build context text
+    context_text = "\n\n".join([
+        f"Document {i+1}: {doc.page_content[:200]}..."
+        for i, doc in enumerate(context_documents[:3])
+    ])
+
+    evaluation_prompt = """
+Bạn là người đánh giá chất lượng câu trả lời. Hãy đánh giá câu trả lời dưới đây theo 3 tiêu chí:
+
+Câu hỏi: {question}
+
+Context từ tài liệu:
+{context}
+
+Câu trả lời cần đánh giá:
+{answer}
+
+Hãy đánh giá từ 0-10 cho mỗi tiêu chí:
+1. Grounding (0-10): Câu trả lời có dựa trên context không?
+2. Relevance (0-10): Câu trả lời có trả lời đúng câu hỏi không?
+3. Completeness (0-10): Câu trả lời có đầy đủ không?
+
+Chỉ trả về 3 số, mỗi số trên một dòng. Ví dụ:
+8
+9
+7
+""".strip()
+
+    try:
+        prompt = evaluation_prompt.format(
+            question=question,
+            context=context_text,
+            answer=answer
+        )
+
+        evaluation_text = llm.invoke(prompt).strip()
+
+        # Parse scores
+        lines = [line.strip() for line in evaluation_text.split('\n') if line.strip()]
+        scores = []
+        for line in lines[:3]:  # Take first 3 lines
+            try:
+                score = float(line)
+                scores.append(min(10.0, max(0.0, score)))  # Clamp to 0-10
+            except ValueError:
+                # Try to extract number from line
+                import re
+                numbers = re.findall(r'\d+\.?\d*', line)
+                if numbers:
+                    scores.append(min(10.0, max(0.0, float(numbers[0]))))
+
+        # Ensure we have 3 scores
+        while len(scores) < 3:
+            scores.append(5.0)  # Default middle score
+
+        grounding, relevance, completeness = scores[:3]
+
+        # Calculate overall confidence (0-1)
+        confidence = (grounding + relevance + completeness) / 30.0
+
+        return {
+            "grounding_score": grounding,
+            "relevance_score": relevance,
+            "completeness_score": completeness,
+            "confidence": confidence,
+            "passed": confidence >= 0.7,  # Threshold
+        }
+
+    except Exception as e:
+        # Fallback: Assume moderate quality
+        return {
+            "grounding_score": 7.0,
+            "relevance_score": 7.0,
+            "completeness_score": 7.0,
+            "confidence": 0.7,
+            "passed": True,
+            "error": str(e),
+        }
+
+
+def multi_hop_retrieval(
+    original_query: str,
+    vectorstore: FAISS,
+    llm: OllamaLLM,
+    config: RAGConfig,
+    max_hops: int = 3,
+) -> Dict[str, Any]:
+    """
+    Multi-hop reasoning: Iterative retrieval cho câu hỏi phức tạp.
+
+    Process:
+    1. Retrieve initial documents
+    2. Generate partial answer
+    3. Nếu cần thêm info → generate follow-up query
+    4. Retrieve more documents
+    5. Refine answer
+    6. Repeat until confident hoặc max hops
+
+    Returns:
+        Dict với final answer, all documents, và hop history
+    """
+
+    all_documents = []
+    hop_history = []
+    current_query = original_query
+
+    for hop in range(max_hops):
+        # Retrieve documents for current query
+        if config.use_reranking:
+            # Use re-ranking if enabled
+            candidates = vectorstore.similarity_search(current_query, k=config.rerank_top_n)
+            hop_docs = rerank_documents(current_query, candidates, config)
+        else:
+            hop_docs = vectorstore.similarity_search(current_query, k=config.top_k)
+
+        all_documents.extend(hop_docs)
+
+        # Generate partial answer
+        context_text = "\n\n".join([doc.page_content for doc in all_documents])
+
+        answer_prompt = f"""
+Dựa trên context sau, hãy trả lời câu hỏi.
+
+Câu hỏi gốc: {original_query}
+Câu hỏi hiện tại: {current_query}
+
+Context:
+{context_text[:2000]}
+
+Nếu context đủ để trả lời đầy đủ, hãy đưa ra câu trả lời.
+Nếu còn thiếu thông tin, hãy nêu rõ cần thêm thông tin gì.
+
+Trả lời:
+""".strip()
+
+        partial_answer = llm.invoke(answer_prompt).strip()
+
+        # Check if we need more information
+        need_more_info = any(phrase in partial_answer.lower() for phrase in [
+            "cần thêm", "thiếu thông tin", "không đủ", "need more", "insufficient"
+        ])
+
+        hop_history.append({
+            "hop": hop + 1,
+            "query": current_query,
+            "num_docs": len(hop_docs),
+            "partial_answer": partial_answer,
+            "need_more_info": need_more_info,
+        })
+
+        if not need_more_info:
+            # Có đủ thông tin, dừng
+            return {
+                "final_answer": partial_answer,
+                "total_hops": hop + 1,
+                "all_documents": all_documents,
+                "hop_history": hop_history,
+                "completed": True,
+            }
+
+        if hop < max_hops - 1:
+            # Generate follow-up query
+            followup_prompt = f"""
+Câu hỏi gốc: {original_query}
+Thông tin hiện có: {partial_answer}
+
+Hãy tạo một câu hỏi follow-up để tìm thêm thông tin cần thiết.
+Chỉ trả về câu hỏi, không giải thích.
+
+Câu hỏi follow-up:
+""".strip()
+
+            current_query = llm.invoke(followup_prompt).strip()
+
+    # Reached max hops
+    return {
+        "final_answer": partial_answer,
+        "total_hops": max_hops,
+        "all_documents": all_documents,
+        "hop_history": hop_history,
+        "completed": False,  # Không đạt được answer đầy đủ
+    }
+
+
+def compare_retrieval_methods(
+    vectorstore: FAISS,
+    query: str,
+    config: RAGConfig,
+) -> Dict[str, Any]:
+    """
+    Compare bi-encoder (FAISS only) vs cross-encoder re-ranking performance.
+
+    Returns:
+        Dictionary with comparison metrics and retrieved documents
+    """
+    start_time = time.time()
+
+    # Bi-encoder only retrieval
+    bi_encoder_start = time.time()
+    bi_encoder_docs = vectorstore.similarity_search(query, k=config.top_k)
+    bi_encoder_time = time.time() - bi_encoder_start
+
+    # Retrieve more candidates for re-ranking
+    retrieval_start = time.time()
+    candidate_docs = vectorstore.similarity_search(query, k=config.rerank_top_n)
+    retrieval_time = time.time() - retrieval_start
+
+    # Cross-encoder re-ranking
+    rerank_start = time.time()
+    reranked_docs, rerank_scores = rerank_documents(
+        query, candidate_docs, config, return_scores=True
+    )
+    rerank_time = time.time() - rerank_start
+
+    total_time = time.time() - start_time
+
+    return {
+        "bi_encoder": {
+            "docs": bi_encoder_docs,
+            "time_ms": round(bi_encoder_time * 1000, 2),
+            "num_docs": len(bi_encoder_docs),
+        },
+        "cross_encoder": {
+            "docs": reranked_docs,
+            "scores": rerank_scores,
+            "time_ms": round((retrieval_time + rerank_time) * 1000, 2),
+            "retrieval_time_ms": round(retrieval_time * 1000, 2),
+            "rerank_time_ms": round(rerank_time * 1000, 2),
+            "num_candidates": len(candidate_docs),
+            "num_final": len(reranked_docs),
+        },
+        "comparison": {
+            "total_time_ms": round(total_time * 1000, 2),
+            "speedup": round(bi_encoder_time / (retrieval_time + rerank_time), 2),
+            "overhead_ms": round((retrieval_time + rerank_time - bi_encoder_time) * 1000, 2),
+        },
+    }
+
+
+def ask_question_with_self_rag(
+    qa_chain: RetrievalQA,
+    question: str,
+    vectorstore: FAISS,
+    config: RAGConfig,
+    conversation_history: Optional[Sequence[Tuple[str, str]]] = None,
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Advanced RAG với Self-RAG capabilities.
+
+    Features:
+    1. Query rewriting (optional)
+    2. Multi-hop reasoning (optional)
+    3. Answer quality evaluation
+    4. Confidence scoring
+
+    Returns:
+        (answer, sources, metadata)
+    """
+
+    metadata = {
+        "used_self_rag": config.use_self_rag,
+        "query_rewriting": config.enable_query_rewriting,
+        "multi_hop": config.enable_multi_hop,
+    }
+
+    # Get LLM from qa_chain in a version-compatible way.
+    llm = _extract_llm_from_qa_chain(qa_chain)
+
+    # Step 1: Query Rewriting (if enabled)
+    if config.use_self_rag and config.enable_query_rewriting:
+        rewrite_result = rewrite_query(question, llm)
+        working_query = rewrite_result["rewritten"]
+        metadata["query_rewrite"] = rewrite_result
+    else:
+        working_query = question
+        metadata["query_rewrite"] = None
+
+    # Step 2: Retrieval (Multi-hop or single)
+    if config.use_self_rag and config.enable_multi_hop:
+        # Multi-hop retrieval
+        multi_hop_result = multi_hop_retrieval(
+            working_query,
+            vectorstore,
+            llm,
+            config,
+            max_hops=config.max_hops,
+        )
+
+        answer = multi_hop_result["final_answer"]
+        retrieved_docs = multi_hop_result["all_documents"]
+        metadata["multi_hop"] = multi_hop_result
+
+    else:
+        # Standard single-hop retrieval
+        retriever = qa_chain.retriever
+        retrieved_docs = _retrieve_documents(retriever, working_query)
+
+        # Generate answer using qa_chain
+        question_lang = detect_question_language(question)
+        response_language = "Vietnamese" if question_lang == "vi" else "English"
+        unknown_phrase = _unknown_phrase_for_language(question_lang)
+        chat_history = _format_recent_history(conversation_history)
+
+        augmented_question = (
+            f"User question: {working_query}\n"
+            f"Response language: {response_language}\n"
+            f"Fallback when missing context: {unknown_phrase}\n"
+            f"Recent conversation:\n{chat_history}"
+        )
+
+        result = qa_chain.invoke({"query": augmented_question})
+        answer = _normalize_unknown_answer(result.get("result", ""), question_lang)
+        metadata["multi_hop"] = None
+
+    # Step 3: Self-evaluation (if enabled)
+    if config.use_self_rag:
+        evaluation = evaluate_answer_quality(
+            question,
+            answer,
+            retrieved_docs,
+            llm,
+        )
+        metadata["evaluation"] = evaluation
+
+        # Check confidence threshold
+        if evaluation["confidence"] < config.confidence_threshold:
+            # Low confidence - could trigger retry or return with warning
+            metadata["low_confidence_warning"] = True
+    else:
+        metadata["evaluation"] = None
+
+    # Step 4: Format sources
+    sources = []
+    for doc in retrieved_docs[:config.top_k]:  # Limit to top_k for display
+        doc_metadata = doc.metadata or {}
+        context_text = (doc.page_content or "").strip()
+        start_pos = doc_metadata.get("position_start", doc_metadata.get("start_index"))
+        end_pos = doc_metadata.get("position_end")
+        if end_pos is None and isinstance(start_pos, int):
+            end_pos = start_pos + len(context_text)
+
+        page_value = doc_metadata.get("page", doc_metadata.get("page_number", "?"))
+        page_value = _normalize_page_number(page_value, doc_metadata)
+        highlight_text = _build_highlight_text(context_text)
+
+        sources.append({
+            "chunk_id": doc_metadata.get("chunk_id", "?"),
+            "source": doc_metadata.get("source", "unknown"),
+            "page": page_value,
+            "position_start": start_pos,
+            "position_end": end_pos,
+            "preview": highlight_text.replace("\n", " "),
+            "highlight_text": highlight_text,
+            "context_text": context_text,
+        })
+
+    return answer, sources, metadata
 
 
 def ask_question(
