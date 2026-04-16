@@ -32,8 +32,8 @@ class RAGConfig:
     chunk_overlap: int = 100
     top_k: int = 3
     temperature: float = 0.1
-    num_ctx: int = 1536
-    num_predict: int = 220
+    num_ctx: int = 4096
+    num_predict: int = 512
     num_gpu: int = 0
     # Re-ranking configuration
     use_reranking: bool = False
@@ -177,6 +177,30 @@ def detect_question_language(question: str) -> str:
         return detect(text)
     except LangDetectException:
         return "unknown"
+
+
+def _normalize_lang_code(lang_code: str) -> str:
+    code = (lang_code or "").strip().lower()
+    if code.startswith("vi"):
+        return "vi"
+    if code.startswith("en"):
+        return "en"
+    return "unknown"
+
+
+def resolve_response_language(question: str, doc_language: str = "unknown") -> str:
+    question_lang = _normalize_lang_code(detect_question_language(question))
+    document_lang = _normalize_lang_code(doc_language)
+
+    # Very short questions are often ambiguous for language detection.
+    if question_lang == "unknown" and len((question or "").split()) <= 5 and document_lang in {"vi", "en"}:
+        return document_lang
+
+    if question_lang in {"vi", "en"}:
+        return question_lang
+    if document_lang in {"vi", "en"}:
+        return document_lang
+    return "en"
 
 
 def split_documents(documents, config: RAGConfig):
@@ -367,6 +391,396 @@ def _format_recent_history(conversation_history: Optional[Sequence[Tuple[str, st
     return "\n".join(lines)
 
 
+def _looks_like_followup(question: str) -> bool:
+    text = (question or "").strip().lower()
+    if not text:
+        return False
+
+    followup_markers = [
+        "nó",
+        "cái đó",
+        "điều đó",
+        "ý trên",
+        "tiếp theo",
+        "them",
+        "thêm",
+        "what about",
+        "how about",
+        "that one",
+        "those",
+        "more details",
+        "explain more",
+        "continue",
+    ]
+    if any(marker in text for marker in followup_markers):
+        return True
+
+    # Short, ambiguous queries are often follow-up questions.
+    return len(text.split()) <= 8
+
+
+def contextualize_question(
+    question: str,
+    llm: OllamaLLM,
+    conversation_history: Optional[Sequence[Tuple[str, str]]] = None,
+) -> Dict[str, Any]:
+    """
+    Rewrite follow-up questions into standalone questions using recent chat history.
+    """
+
+    if not conversation_history:
+        return {
+            "original": question,
+            "standalone": question,
+            "used_contextualization": False,
+            "followup_detected": False,
+        }
+
+    followup_detected = _looks_like_followup(question)
+    recent_history = list(conversation_history)[-8:]
+    history_text = _format_recent_history(recent_history)
+
+    prompt = f"""
+You rewrite conversational follow-up questions for RAG retrieval.
+Bạn viết lại câu hỏi follow-up cho truy hồi RAG.
+
+Recent conversation:
+{history_text}
+
+New user question:
+{question}
+
+Requirements:
+1) If the new question is a follow-up, rewrite it into ONE standalone query with enough context.
+2) If it is already standalone, keep its core meaning unchanged.
+3) Keep the same language as the user's question (Vietnamese or English).
+4) Return ONLY the rewritten standalone query, no explanation.
+
+Standalone query:
+""".strip()
+
+    try:
+        rewritten = (llm.invoke(prompt) or "").strip()
+        if not rewritten:
+            rewritten = question
+        return {
+            "original": question,
+            "standalone": rewritten,
+            "used_contextualization": True,
+            "followup_detected": followup_detected,
+        }
+    except Exception:
+        return {
+            "original": question,
+            "standalone": question,
+            "used_contextualization": False,
+            "followup_detected": followup_detected,
+        }
+
+
+def _deduplicate_documents(documents: List[Document]) -> List[Document]:
+    seen: set[Tuple[str, str, Any]] = set()
+    unique_docs: List[Document] = []
+    for doc in documents:
+        meta = doc.metadata or {}
+        key = (
+            str(meta.get("source", "")),
+            str(meta.get("chunk_id", "")),
+            meta.get("start_index", meta.get("position_start")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_docs.append(doc)
+    return unique_docs
+
+
+def _build_context_from_documents(documents: List[Document], max_chars: int = 3600) -> str:
+    parts: List[str] = []
+    current_len = 0
+    for idx, doc in enumerate(documents, start=1):
+        meta = doc.metadata or {}
+        source = meta.get("source", "unknown")
+        page = _normalize_page_number(meta.get("page", meta.get("page_number", "?")), meta)
+        raw_text = (doc.page_content or "").strip()
+        # Cap each chunk contribution so the answer prompt stays within model context window.
+        if len(raw_text) > 1200:
+            raw_text = raw_text[:1200].rstrip() + "..."
+
+        section = f"[Doc {idx} | Source: {source} | Page: {page}]\n{raw_text}"
+        if not section.strip():
+            continue
+
+        projected = current_len + len(section) + 2
+        if projected > max_chars:
+            remaining = max_chars - current_len
+            if remaining > 80:
+                parts.append(section[:remaining].rstrip())
+            break
+
+        parts.append(section)
+        current_len = projected
+
+    return "\n\n".join(parts).strip()
+
+
+def _looks_truncated_answer(text: str) -> bool:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+
+    if cleaned.endswith((".", "!", "?", "\"", "'", "”", "’", "))", "]")):
+        return False
+
+    lower_tail = cleaned[-40:].lower()
+    tail_markers = [
+        " and",
+        " or",
+        " because",
+        " such as",
+        " bao gồm",
+        " và",
+        " hoặc",
+        " vì",
+        " như",
+    ]
+    if any(lower_tail.endswith(marker) for marker in tail_markers):
+        return True
+
+    # If output is long but does not end at sentence boundary, likely token cutoff.
+    return len(cleaned) >= 120
+
+
+def _complete_truncated_answer(
+    llm: OllamaLLM,
+    partial_answer: str,
+    question: str,
+    context_text: str,
+    response_language: str,
+) -> str:
+    completion_prompt = f"""
+Continue the unfinished answer below and complete it naturally.
+
+Language: {response_language}
+Question: {question}
+Context:
+{context_text[:1800]}
+
+Current partial answer:
+{partial_answer}
+
+Requirements:
+1) Continue only from where it stopped; do not restart from the beginning.
+2) Use only facts from Context.
+3) Add at most 2 short sentences and end with a complete sentence.
+4) Return only the continuation text.
+
+Continuation:
+""".strip()
+
+    try:
+        continuation = (llm.invoke(completion_prompt) or "").strip()
+    except Exception:
+        continuation = ""
+
+    if not continuation:
+        return partial_answer
+
+    joined = f"{partial_answer.rstrip()} {continuation.lstrip()}".strip()
+    return joined
+
+
+def _maybe_translate_answer_to_target_language(
+    llm: OllamaLLM,
+    answer: str,
+    target_lang: str,
+) -> str:
+    text = (answer or "").strip()
+    target = _normalize_lang_code(target_lang)
+    if not text or target not in {"vi", "en"}:
+        return text
+
+    try:
+        detected = _normalize_lang_code(detect(text))
+    except Exception:
+        detected = "unknown"
+
+    if detected == target:
+        return text
+
+    if target == "vi":
+        prompt = f"""
+Dich doan tra loi sau sang tieng Viet tu nhien.
+Giu nguyen y nghia, ten rieng, so lieu va cac thong tin ky thuat.
+Chi tra ve ban dich, khong them giai thich.
+
+Noi dung:
+{text}
+
+Ban dich tieng Viet:
+""".strip()
+    else:
+        prompt = f"""
+Translate the following answer into natural English.
+Preserve all facts, names, numbers, and technical details.
+Return only the translated answer, no explanation.
+
+Content:
+{text}
+
+English translation:
+""".strip()
+
+    try:
+        translated = (llm.invoke(prompt) or "").strip()
+        return translated or text
+    except Exception:
+        return text
+
+
+def _is_uncertain_non_answer(text: str) -> bool:
+    cleaned = (text or "").strip().casefold()
+    if not cleaned:
+        return True
+
+    patterns = [
+        "không thể hiểu",
+        "khong the hieu",
+        "cung cấp thêm thông tin",
+        "cung cap them thong tin",
+        "mô tả chi tiết",
+        "mo ta chi tiet",
+        "bạn có thể cung cấp",
+        "ban co the cung cap",
+        "i cannot understand",
+        "cannot understand",
+        "please provide more information",
+        "can you provide more",
+    ]
+    return any(p in cleaned for p in patterns)
+
+
+def _regenerate_with_strict_answering(
+    llm: OllamaLLM,
+    question: str,
+    context_text: str,
+    response_language: str,
+) -> str:
+    prompt = f"""
+You must answer using only the provided excerpts.
+
+Language: {response_language}
+Question: {question}
+
+Excerpts:
+{context_text}
+
+Rules:
+1) Do not ask the user for more information.
+2) Do not say you cannot understand.
+3) Provide the best possible concise summary from the excerpts.
+4) If evidence is limited, state that briefly but still answer from available excerpts.
+5) 3-5 sentences.
+
+Answer:
+""".strip()
+
+    try:
+        return (llm.invoke(prompt) or "").strip()
+    except Exception:
+        return ""
+
+
+def _generate_answer_from_documents(
+    llm: OllamaLLM,
+    question: str,
+    documents: List[Document],
+    response_lang: str,
+    doc_language: str = "unknown",
+    conversation_history: Optional[Sequence[Tuple[str, str]]] = None,
+) -> str:
+    lang_code = _normalize_lang_code(response_lang)
+    response_language = "Vietnamese" if lang_code == "vi" else "English"
+    unknown_phrase = _unknown_phrase_for_language(lang_code)
+    chat_history = _format_recent_history(conversation_history)
+    context_text = _build_context_from_documents(documents)
+
+    if lang_code == "vi":
+        prompt = f"""
+Bạn là trợ lý AI chính xác và trung thực.
+
+Lịch sử hội thoại gần đây:
+{chat_history}
+
+Ngôn ngữ tài liệu tham khảo: {doc_language}
+
+Context:
+{context_text}
+
+Câu hỏi hiện tại:
+{question}
+
+Yêu cầu bắt buộc:
+1) Chỉ dùng thông tin có trong Context.
+2) Có thể dùng lịch sử hội thoại để hiểu tham chiếu như "nó", "ý trước".
+3) Nếu Context không đủ thông tin, chỉ trả về đúng một câu: {unknown_phrase}
+4) Chỉ trả lời bằng tiếng Việt.
+5) Trả lời ngắn gọn, đầy đủ ý chính.
+
+Trả lời:
+""".strip()
+    else:
+        prompt = f"""
+You are an accurate and honest AI assistant.
+
+Recent conversation:
+{chat_history}
+
+Document language hint: {doc_language}
+
+Context:
+{context_text}
+
+Current user question:
+{question}
+
+Mandatory rules:
+1) Use only facts from Context.
+2) You may use conversation history only to resolve references.
+3) If Context is insufficient, return exactly one sentence: {unknown_phrase}
+4) Respond only in English.
+5) Keep the answer concise but complete.
+
+Answer:
+""".strip()
+
+    answer = (llm.invoke(prompt) or "").strip()
+
+    # If the model refuses despite having excerpts, force one strict retry.
+    if context_text and _is_uncertain_non_answer(answer):
+        retried = _regenerate_with_strict_answering(
+            llm,
+            question,
+            context_text,
+            response_language,
+        )
+        if retried:
+            answer = retried
+
+    if _looks_truncated_answer(answer):
+        answer = _complete_truncated_answer(
+            llm,
+            answer,
+            question,
+            context_text,
+            response_language,
+        )
+
+    # Ensure final response matches the user's language choice.
+    answer = _maybe_translate_answer_to_target_language(llm, answer, lang_code)
+    return _normalize_unknown_answer(answer, lang_code)
+
+
 def _unknown_phrase_for_language(lang_code: str) -> str:
     return "Tôi không biết" if lang_code == "vi" else "I don't know"
 
@@ -377,16 +791,37 @@ def _normalize_unknown_answer(answer: str, lang_code: str) -> str:
     if not cleaned:
         return fallback
 
-    lowered = cleaned.lower()
+    normalized = cleaned.casefold().strip()
+    fallback_norm = fallback.casefold().strip()
+    # If the model starts with fallback but keeps generating extra text, force exact fallback.
+    if normalized.startswith(fallback_norm):
+        tail = normalized[len(fallback_norm):].strip(" .,:;!?-\n\t")
+        if tail:
+            return fallback
+        return fallback
+
+    lowered = cleaned.casefold()
     unknown_patterns = [
         "khong du thong tin",
         "không đủ thông tin",
         "tai lieu khong co",
         "tài liệu không có",
+        "không thể hiểu",
+        "khong the hieu",
+        "cung cấp thêm thông tin",
+        "cung cap them thong tin",
+        "bạn có thể cung cấp",
+        "ban co the cung cap",
         "not enough information",
         "does not contain",
         "cannot find in context",
         "insufficient context",
+        "cannot understand",
+        "please provide more information",
+        "i don't know",
+        "toi khong biet",
+        "tôi không biết",
+        "我不知道",
     ]
 
     if any(pattern in lowered for pattern in unknown_patterns):
@@ -454,10 +889,100 @@ def _retrieve_documents(retriever: Any, query: str) -> List[Document]:
     raise AttributeError("Retriever does not support `invoke` or `get_relevant_documents`.")
 
 
+def _translate_query_for_retrieval(
+    query: str,
+    source_lang: str,
+    target_lang: str,
+    llm: OllamaLLM,
+) -> str:
+    if not query.strip() or source_lang == target_lang:
+        return query
+
+    if source_lang == "vi" and target_lang == "en":
+        prompt = f"""
+Translate this Vietnamese search query into natural English for semantic document retrieval.
+Keep meaning, named entities, numbers, and constraints unchanged.
+Return only the translated query.
+
+Vietnamese query:
+{query}
+
+English query:
+""".strip()
+    elif source_lang == "en" and target_lang == "vi":
+        prompt = f"""
+Dich cau truy van tim kiem tieng Anh sau sang tieng Viet de truy hoi tai lieu.
+Giu nguyen y nghia, ten rieng, so lieu va rang buoc.
+Chi tra ve cau dich, khong giai thich.
+
+English query:
+{query}
+
+Vietnamese query:
+""".strip()
+    else:
+        return query
+
+    try:
+        translated = (llm.invoke(prompt) or "").strip()
+        return translated or query
+    except Exception:
+        return query
+
+
+def _build_retrieval_queries(
+    base_query: str,
+    question_lang: str,
+    doc_language: str,
+    llm: OllamaLLM,
+) -> List[str]:
+    queries = [base_query]
+    q_lang = _normalize_lang_code(question_lang)
+    d_lang = _normalize_lang_code(doc_language)
+
+    if q_lang in {"vi", "en"} and d_lang in {"vi", "en"} and q_lang != d_lang:
+        translated = _translate_query_for_retrieval(base_query, q_lang, d_lang, llm)
+        if translated and translated.strip() and translated.strip() != base_query.strip():
+            queries.append(translated.strip())
+
+    unique: List[str] = []
+    seen: set[str] = set()
+    for q in queries:
+        key = q.strip().casefold()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(q.strip())
+    return unique
+
+
+def _retrieve_documents_cross_language(
+    retriever: Any,
+    base_query: str,
+    question_lang: str,
+    doc_language: str,
+    llm: OllamaLLM,
+) -> Tuple[List[Document], List[str]]:
+    queries = _build_retrieval_queries(base_query, question_lang, doc_language, llm)
+
+    merged_docs: List[Document] = []
+    for q in queries:
+        merged_docs.extend(_retrieve_documents(retriever, q))
+
+    merged_docs = _deduplicate_documents(list(merged_docs or []))
+
+    # If retriever includes config (RerankingRetriever), re-rank merged candidates.
+    cfg = getattr(retriever, "config", None)
+    if cfg is not None and getattr(cfg, "use_reranking", False) and merged_docs:
+        rerank_query = queries[0]
+        merged_docs = rerank_documents(rerank_query, merged_docs, cfg)
+
+    return merged_docs, queries
+
+
 def rewrite_query(
     original_query: str,
     llm: OllamaLLM,
-    language: str = "vi",
+    language: str = "unknown",
 ) -> Dict[str, Any]:
     """
     Rewrite user query để cải thiện retrieval quality.
@@ -472,18 +997,19 @@ def rewrite_query(
     """
 
     prompt_template = """
-Bạn là chuyên gia phân tích câu hỏi. Nhiệm vụ của bạn là cải thiện câu hỏi để tìm kiếm tài liệu chính xác hơn.
+You are a query optimizer for RAG retrieval.
+Bạn là công cụ tối ưu câu hỏi cho truy hồi RAG.
 
-Câu hỏi gốc: {query}
+Original query:
+{query}
 
-Hãy viết lại câu hỏi này theo các cách sau:
-1. Thêm từ khóa liên quan (synonyms, related terms)
-2. Làm rõ ý định của câu hỏi
-3. Nếu câu hỏi phức tạp, chia nhỏ thành các sub-questions
+Requirements:
+1) Preserve the original meaning.
+2) Keep the same language as the original query.
+3) Make entities, constraints, and intent explicit for better retrieval.
+4) Return ONLY one rewritten query, no explanation.
 
-Chỉ trả về câu hỏi đã được cải thiện, không giải thích.
-
-Câu hỏi cải thiện:
+Rewritten query:
 """.strip()
 
     try:
@@ -531,22 +1057,23 @@ def evaluate_answer_quality(
     ])
 
     evaluation_prompt = """
-Bạn là người đánh giá chất lượng câu trả lời. Hãy đánh giá câu trả lời dưới đây theo 3 tiêu chí:
+You are an answer quality evaluator.
+Bạn là người đánh giá chất lượng câu trả lời.
 
-Câu hỏi: {question}
+Question / Câu hỏi: {question}
 
-Context từ tài liệu:
+Context:
 {context}
 
-Câu trả lời cần đánh giá:
+Answer to evaluate:
 {answer}
 
-Hãy đánh giá từ 0-10 cho mỗi tiêu chí:
-1. Grounding (0-10): Câu trả lời có dựa trên context không?
-2. Relevance (0-10): Câu trả lời có trả lời đúng câu hỏi không?
-3. Completeness (0-10): Câu trả lời có đầy đủ không?
+Score from 0-10 for each criterion:
+1. Grounding (0-10): Is the answer supported by context?
+2. Relevance (0-10): Does it answer the question?
+3. Completeness (0-10): Is it sufficiently complete?
 
-Chỉ trả về 3 số, mỗi số trên một dòng. Ví dụ:
+Return only 3 numbers, one per line. Example:
 8
 9
 7
@@ -645,18 +1172,19 @@ def multi_hop_retrieval(
         context_text = "\n\n".join([doc.page_content for doc in all_documents])
 
         answer_prompt = f"""
-Dựa trên context sau, hãy trả lời câu hỏi.
+    Answer the question using context below.
+    Trả lời câu hỏi dựa trên context bên dưới.
 
-Câu hỏi gốc: {original_query}
-Câu hỏi hiện tại: {current_query}
+    Original question: {original_query}
+    Current question: {current_query}
 
 Context:
 {context_text[:2000]}
 
-Nếu context đủ để trả lời đầy đủ, hãy đưa ra câu trả lời.
-Nếu còn thiếu thông tin, hãy nêu rõ cần thêm thông tin gì.
+    If context is enough, provide the answer.
+    If not enough, clearly state what information is still needed.
 
-Trả lời:
+    Answer:
 """.strip()
 
         partial_answer = llm.invoke(answer_prompt).strip()
@@ -687,13 +1215,13 @@ Trả lời:
         if hop < max_hops - 1:
             # Generate follow-up query
             followup_prompt = f"""
-Câu hỏi gốc: {original_query}
-Thông tin hiện có: {partial_answer}
+Original question: {original_query}
+Current findings: {partial_answer}
 
-Hãy tạo một câu hỏi follow-up để tìm thêm thông tin cần thiết.
-Chỉ trả về câu hỏi, không giải thích.
+Create ONE follow-up retrieval query to fetch missing facts.
+Return only the query text, no explanation.
 
-Câu hỏi follow-up:
+Follow-up query:
 """.strip()
 
             current_query = llm.invoke(followup_prompt).strip()
@@ -769,6 +1297,7 @@ def ask_question_with_self_rag(
     vectorstore: FAISS,
     config: RAGConfig,
     conversation_history: Optional[Sequence[Tuple[str, str]]] = None,
+    doc_language: str = "unknown",
 ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     """
     Advanced RAG với Self-RAG capabilities.
@@ -792,16 +1321,24 @@ def ask_question_with_self_rag(
     # Get LLM from qa_chain in a version-compatible way.
     llm = _extract_llm_from_qa_chain(qa_chain)
 
-    # Step 1: Query Rewriting (if enabled)
+    # Step 1: Contextualize follow-up question from chat memory.
+    contextualized = contextualize_question(question, llm, conversation_history)
+    working_query = contextualized["standalone"]
+    metadata["contextualization"] = contextualized
+
+    # Step 2: Query Rewriting (if enabled)
     if config.use_self_rag and config.enable_query_rewriting:
-        rewrite_result = rewrite_query(question, llm)
+        rewrite_result = rewrite_query(
+            working_query,
+            llm,
+            language=resolve_response_language(question, doc_language),
+        )
         working_query = rewrite_result["rewritten"]
         metadata["query_rewrite"] = rewrite_result
     else:
-        working_query = question
         metadata["query_rewrite"] = None
 
-    # Step 2: Retrieval (Multi-hop or single)
+    # Step 3: Retrieval (Multi-hop or single)
     if config.use_self_rag and config.enable_multi_hop:
         # Multi-hop retrieval
         multi_hop_result = multi_hop_retrieval(
@@ -812,33 +1349,42 @@ def ask_question_with_self_rag(
             max_hops=config.max_hops,
         )
 
-        answer = multi_hop_result["final_answer"]
-        retrieved_docs = multi_hop_result["all_documents"]
+        retrieved_docs = _deduplicate_documents(multi_hop_result["all_documents"])
+        answer = _generate_answer_from_documents(
+            llm,
+            question,
+            retrieved_docs,
+            resolve_response_language(question, doc_language),
+            doc_language,
+            conversation_history,
+        )
         metadata["multi_hop"] = multi_hop_result
 
     else:
         # Standard single-hop retrieval
         retriever = qa_chain.retriever
-        retrieved_docs = _retrieve_documents(retriever, working_query)
-
-        # Generate answer using qa_chain
-        question_lang = detect_question_language(question)
-        response_language = "Vietnamese" if question_lang == "vi" else "English"
-        unknown_phrase = _unknown_phrase_for_language(question_lang)
-        chat_history = _format_recent_history(conversation_history)
-
-        augmented_question = (
-            f"User question: {working_query}\n"
-            f"Response language: {response_language}\n"
-            f"Fallback when missing context: {unknown_phrase}\n"
-            f"Recent conversation:\n{chat_history}"
+        question_lang = resolve_response_language(question, doc_language)
+        retrieved_docs, used_queries = _retrieve_documents_cross_language(
+            retriever,
+            working_query,
+            question_lang,
+            doc_language,
+            llm,
         )
+        metadata["retrieval_queries"] = used_queries
 
-        result = qa_chain.invoke({"query": augmented_question})
-        answer = _normalize_unknown_answer(result.get("result", ""), question_lang)
+        # Generate answer with context + recent conversation memory
+        answer = _generate_answer_from_documents(
+            llm,
+            question,
+            retrieved_docs,
+            question_lang,
+            doc_language,
+            conversation_history,
+        )
         metadata["multi_hop"] = None
 
-    # Step 3: Self-evaluation (if enabled)
+    # Step 4: Self-evaluation (if enabled)
     if config.use_self_rag:
         evaluation = evaluate_answer_quality(
             question,
@@ -855,7 +1401,7 @@ def ask_question_with_self_rag(
     else:
         metadata["evaluation"] = None
 
-    # Step 4: Format sources
+    # Step 5: Format sources
     sources = []
     for doc in retrieved_docs[:config.top_k]:  # Limit to top_k for display
         doc_metadata = doc.metadata or {}
@@ -887,22 +1433,23 @@ def ask_question(
     qa_chain: RetrievalQA,
     question: str,
     conversation_history: Optional[Sequence[Tuple[str, str]]] = None,
+    doc_language: str = "unknown",
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    question_lang = detect_question_language(question)
-    response_language = "Vietnamese" if question_lang == "vi" else "English"
-    unknown_phrase = _unknown_phrase_for_language(question_lang)
-    chat_history = _format_recent_history(conversation_history)
-    augmented_question = (
-        f"User question: {question}\n"
-        f"Response language: {response_language}\n"
-        f"Fallback when missing context: {unknown_phrase}\n"
-        f"Recent conversation:\n{chat_history}"
-    )
+    question_lang = resolve_response_language(question, doc_language)
+    llm = _extract_llm_from_qa_chain(qa_chain)
+    contextualized = contextualize_question(question, llm, conversation_history)
+    retrieval_query = contextualized["standalone"]
 
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            result = qa_chain.invoke({"query": augmented_question})
+            docs, _used_queries = _retrieve_documents_cross_language(
+                qa_chain.retriever,
+                retrieval_query,
+                question_lang,
+                doc_language,
+                llm,
+            )
             break
         except Exception as exc:
             last_error = exc
@@ -913,8 +1460,15 @@ def ask_question(
     else:
         raise RuntimeError("Không thể sinh câu trả lời từ Ollama.") from last_error
 
-    answer = _normalize_unknown_answer(result.get("result", ""), question_lang)
-    docs = result.get("source_documents", [])
+    docs = _deduplicate_documents(list(docs or []))
+    answer = _generate_answer_from_documents(
+        llm,
+        question,
+        docs,
+        question_lang,
+        doc_language,
+        conversation_history,
+    )
 
     sources: List[Dict[str, Any]] = []
     for doc in docs:

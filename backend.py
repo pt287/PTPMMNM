@@ -464,6 +464,23 @@ def _fetch_qa_by_session(session_id: int, limit: int) -> List[Dict[str, Any]]:
     return records
 
 
+def _load_conversation_history_from_session(session_id: int, max_pairs: int = 12) -> List[tuple[str, str]]:
+    qa_records = _fetch_qa_by_session(session_id, max_pairs)
+    if not qa_records:
+        return []
+
+    history: List[tuple[str, str]] = []
+    for row in reversed(qa_records):
+        question = (row.get("question") or "").strip()
+        answer = (row.get("answer") or "").strip()
+        if question:
+            history.append(("user", question))
+        if answer:
+            history.append(("assistant", answer))
+
+    return history[-24:]
+
+
 def _fetch_session_info(session_id: int) -> Optional[Dict[str, Any]]:
     with db_lock:
         with _get_connection() as conn:
@@ -683,7 +700,7 @@ def activate_session(session_id: int) -> dict:
     if hasattr(qa_chain.retriever, 'vectorstore'):
         state.vectorstore = qa_chain.retriever.vectorstore
     state.current_session_id = session_id
-    state.conversation_history = []
+    state.conversation_history = _load_conversation_history_from_session(session_id)
 
     return {
         "message": "Session activated.",
@@ -873,6 +890,7 @@ def ask(payload: AskPayload) -> dict:
                 state.vectorstore,
                 self_rag_config,
                 conversation_history=state.conversation_history,
+                doc_language=state.doc_language,
             )
         else:
             # Standard RAG
@@ -880,6 +898,7 @@ def ask(payload: AskPayload) -> dict:
                 state.qa_chain,
                 question,
                 conversation_history=state.conversation_history,
+                doc_language=state.doc_language,
             )
             metadata = None
     except Exception as exc:
