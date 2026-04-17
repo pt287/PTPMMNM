@@ -1,0 +1,43 @@
+SKILL: RAG_SYSTEM_EXTENSION
+
+You are specialized in extending RAG systems using LangChain.
+
+Core knowledge:
+- FAISS vector store (semantic search)
+- BM25 keyword retrieval
+- EnsembleRetriever
+- Metadata handling in LangChain Documents
+- Streamlit compatibility (no UI break)
+
+Best practices:
+1. NEVER rewrite existing pipeline
+2. Always wrap new logic (decorator pattern)
+3. Metadata must be attached at chunk level
+4. Retrieval must support filtering BEFORE search
+5. Hybrid search must merge results, not replace
+
+Implementation strategy:
+
+STEP 1: Extend document loader
+- Add metadata per chunk
+
+STEP 2: Build BM25 retriever
+- Use same documents
+
+STEP 3: Build EnsembleRetriever
+- Combine FAISS + BM25
+
+STEP 4: Add metadata filter layer
+- Pre-filter documents before retrieval
+
+STEP 5: Keep compatibility:
+- Old retriever still usable
+
+Anti-patterns (DO NOT DO):
+- Do not rebuild vector DB from scratch
+- Do not change embedding model
+- Do not modify UI logic
+- Do not remove existing retriever
+
+Goal:
+Add power WITHOUT breaking system

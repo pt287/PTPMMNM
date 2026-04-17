@@ -23,6 +23,7 @@ from rag_engine import (
 
 class AskPayload(BaseModel):
     question: str
+    filter_metadata: Optional[Dict[str, Any]] = None
 
 
 app = FastAPI(title="SmartDoc AI API")
@@ -47,6 +48,7 @@ class AppState:
         self.use_reranking = False
         self.reranker_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
         self.rerank_top_n = 10
+        self.use_hybrid_search = False
 
         # Self-RAG state
         self.use_self_rag = False
@@ -82,7 +84,8 @@ def _init_db() -> None:
                     chunk_overlap INTEGER NOT NULL DEFAULT 100,
                     ollama_model TEXT NOT NULL,
                     embedding_model TEXT NOT NULL,
-                    temperature REAL NOT NULL
+                    temperature REAL NOT NULL,
+                    use_hybrid_search INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -94,6 +97,9 @@ def _init_db() -> None:
                     file_name TEXT NOT NULL,
                     file_size INTEGER NOT NULL,
                     stored_path TEXT,
+                    doc_id TEXT,
+                    uploaded_at TEXT,
+                    file_type TEXT,
                     FOREIGN KEY(session_id) REFERENCES index_sessions(id) ON DELETE CASCADE
                 )
                 """
@@ -119,6 +125,12 @@ def _init_db() -> None:
             }
             if "stored_path" not in pdf_columns:
                 conn.execute("ALTER TABLE session_pdfs ADD COLUMN stored_path TEXT")
+            if "doc_id" not in pdf_columns:
+                conn.execute("ALTER TABLE session_pdfs ADD COLUMN doc_id TEXT")
+            if "uploaded_at" not in pdf_columns:
+                conn.execute("ALTER TABLE session_pdfs ADD COLUMN uploaded_at TEXT")
+            if "file_type" not in pdf_columns:
+                conn.execute("ALTER TABLE session_pdfs ADD COLUMN file_type TEXT")
 
             session_columns = {
                 row["name"]
@@ -128,6 +140,8 @@ def _init_db() -> None:
                 conn.execute("ALTER TABLE index_sessions ADD COLUMN chunk_size INTEGER NOT NULL DEFAULT 1500")
             if "chunk_overlap" not in session_columns:
                 conn.execute("ALTER TABLE index_sessions ADD COLUMN chunk_overlap INTEGER NOT NULL DEFAULT 100")
+            if "use_hybrid_search" not in session_columns:
+                conn.execute("ALTER TABLE index_sessions ADD COLUMN use_hybrid_search INTEGER NOT NULL DEFAULT 0")
             if "use_reranking" not in session_columns:
                 conn.execute("ALTER TABLE index_sessions ADD COLUMN use_reranking INTEGER NOT NULL DEFAULT 0")
             if "reranker_model" not in session_columns:
@@ -180,6 +194,7 @@ def _store_index_session(
     ollama_model: str,
     embedding_model: str,
     temperature: float,
+    use_hybrid_search: bool,
     use_reranking: bool,
     reranker_model: str,
     rerank_top_n: int,
@@ -196,9 +211,10 @@ def _store_index_session(
                 """
                 INSERT INTO index_sessions (
                     doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature,
+                    use_hybrid_search,
                     use_reranking, reranker_model, rerank_top_n,
                     use_self_rag, enable_query_rewriting, enable_multi_hop, max_hops, confidence_threshold
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     doc_language,
@@ -208,6 +224,7 @@ def _store_index_session(
                     ollama_model,
                     embedding_model,
                     temperature,
+                    1 if use_hybrid_search else 0,
                     1 if use_reranking else 0,
                     reranker_model if use_reranking else None,
                     rerank_top_n,
@@ -229,13 +246,18 @@ def _store_index_session(
                         item["file_name"],
                         item["file_size"],
                         stored_path,
+                        item.get("doc_id"),
+                        item.get("upload_time"),
+                        item.get("file_type"),
                     )
                 )
 
             conn.executemany(
                 """
-                INSERT INTO session_pdfs (session_id, file_name, file_size, stored_path)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO session_pdfs (
+                    session_id, file_name, file_size, stored_path, doc_id, uploaded_at, file_type
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 db_file_rows,
             )
@@ -270,6 +292,7 @@ def _fetch_upload_history(limit: int) -> List[Dict[str, Any]]:
             sessions = conn.execute(
                 """
                 SELECT id, created_at, doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature,
+                       use_hybrid_search,
                        use_reranking, reranker_model, rerank_top_n,
                        use_self_rag, enable_query_rewriting, enable_multi_hop, max_hops, confidence_threshold
                 FROM index_sessions
@@ -283,7 +306,7 @@ def _fetch_upload_history(limit: int) -> List[Dict[str, Any]]:
             for row in sessions:
                 pdf_rows = conn.execute(
                     """
-                    SELECT file_name, file_size
+                    SELECT file_name, file_size, doc_id, uploaded_at, file_type
                     FROM session_pdfs
                     WHERE session_id = ?
                     ORDER BY id ASC
@@ -292,7 +315,13 @@ def _fetch_upload_history(limit: int) -> List[Dict[str, Any]]:
                 ).fetchall()
 
                 pdf_files = [
-                    {"file_name": file_row["file_name"], "file_size": file_row["file_size"]}
+                    {
+                        "file_name": file_row["file_name"],
+                        "file_size": file_row["file_size"],
+                        "doc_id": file_row["doc_id"],
+                        "upload_time": file_row["uploaded_at"],
+                        "file_type": file_row["file_type"],
+                    }
                     for file_row in pdf_rows
                 ]
 
@@ -307,6 +336,7 @@ def _fetch_upload_history(limit: int) -> List[Dict[str, Any]]:
                         "ollama_model": row["ollama_model"],
                         "embedding_model": row["embedding_model"],
                         "temperature": row["temperature"],
+                        "use_hybrid_search": bool(row["use_hybrid_search"]),
                         "use_reranking": bool(row["use_reranking"]),
                         "reranker_model": row["reranker_model"],
                         "rerank_top_n": row["rerank_top_n"],
@@ -362,7 +392,7 @@ def _fetch_session_files(session_id: int) -> List[Dict[str, Any]]:
         with _get_connection() as conn:
             rows = conn.execute(
                 """
-                SELECT file_name, file_size, stored_path
+                SELECT file_name, file_size, stored_path, doc_id, uploaded_at, file_type
                 FROM session_pdfs
                 WHERE session_id = ?
                 ORDER BY id ASC
@@ -375,6 +405,9 @@ def _fetch_session_files(session_id: int) -> List[Dict[str, Any]]:
             "file_name": row["file_name"],
             "file_size": row["file_size"],
             "stored_path": row["stored_path"],
+            "doc_id": row["doc_id"],
+            "upload_time": row["uploaded_at"],
+            "file_type": row["file_type"],
         }
         for row in rows
     ]
@@ -470,6 +503,7 @@ def _fetch_session_info(session_id: int) -> Optional[Dict[str, Any]]:
             row = conn.execute(
                 """
                 SELECT id, created_at, doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature,
+                       use_hybrid_search,
                        use_reranking, reranker_model, rerank_top_n,
                        use_self_rag, enable_query_rewriting, enable_multi_hop, max_hops, confidence_threshold
                 FROM index_sessions
@@ -491,6 +525,7 @@ def _fetch_session_info(session_id: int) -> Optional[Dict[str, Any]]:
         "ollama_model": row["ollama_model"],
         "embedding_model": row["embedding_model"],
         "temperature": row["temperature"],
+        "use_hybrid_search": bool(row["use_hybrid_search"]),
         "use_reranking": bool(row["use_reranking"]),
         "reranker_model": row["reranker_model"],
         "rerank_top_n": row["rerank_top_n"],
@@ -560,6 +595,7 @@ def health() -> dict:
         "chunk_count": state.chunk_count,
         "chunk_size": state.chunk_size,
         "chunk_overlap": state.chunk_overlap,
+        "use_hybrid_search": state.use_hybrid_search,
         "use_reranking": state.use_reranking,
         "reranker_model": state.reranker_model,
         "rerank_top_n": state.rerank_top_n,
@@ -597,11 +633,18 @@ def session_history(session_id: int, limit: int = 30) -> dict:
             "chunk_count": session["chunk_count"],
             "chunk_size": session["chunk_size"],
             "chunk_overlap": session["chunk_overlap"],
+            "use_hybrid_search": session["use_hybrid_search"],
             "use_reranking": session["use_reranking"],
             "reranker_model": session["reranker_model"],
             "rerank_top_n": session["rerank_top_n"],
             "pdf_files": [
-                {"file_name": item["file_name"], "file_size": item["file_size"]}
+                {
+                    "file_name": item["file_name"],
+                    "file_size": item["file_size"],
+                    "doc_id": item.get("doc_id"),
+                    "upload_time": item.get("upload_time"),
+                    "file_type": item.get("file_type"),
+                }
                 for item in files
             ],
         },
@@ -620,6 +663,7 @@ def activate_session(session_id: int) -> dict:
         raise HTTPException(status_code=400, detail="Session has no files.")
 
     pdf_items: List[Any] = []
+    document_metadata: List[Dict[str, Any]] = []
     missing_files: List[str] = []
     for item in files:
         stored_path = item.get("stored_path")
@@ -633,6 +677,14 @@ def activate_session(session_id: int) -> dict:
             continue
 
         pdf_items.append((item["file_name"], path.read_bytes()))
+        document_metadata.append(
+            {
+                "source": item["file_name"],
+                "doc_id": item.get("doc_id"),
+                "upload_time": item.get("upload_time"),
+                "file_type": item.get("file_type"),
+            }
+        )
 
     if missing_files:
         raise HTTPException(
@@ -651,6 +703,7 @@ def activate_session(session_id: int) -> dict:
         chunk_overlap=session["chunk_overlap"],
         top_k=3,
         temperature=session["temperature"],
+        use_hybrid_search=session["use_hybrid_search"],
         use_reranking=session["use_reranking"],
         reranker_model=session["reranker_model"] or "cross-encoder/ms-marco-MiniLM-L-6-v2",
         rerank_top_n=session["rerank_top_n"],
@@ -662,7 +715,11 @@ def activate_session(session_id: int) -> dict:
     )
 
     try:
-        qa_chain, doc_language, chunk_count = build_rag_pipeline(pdf_items, config)
+        qa_chain, doc_language, chunk_count = build_rag_pipeline(
+            pdf_items,
+            config,
+            document_metadata=document_metadata,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -671,6 +728,7 @@ def activate_session(session_id: int) -> dict:
     state.chunk_count = chunk_count
     state.chunk_size = session["chunk_size"]
     state.chunk_overlap = session["chunk_overlap"]
+    state.use_hybrid_search = session["use_hybrid_search"]
     state.use_reranking = session["use_reranking"]
     state.reranker_model = session["reranker_model"] or "cross-encoder/ms-marco-MiniLM-L-6-v2"
     state.rerank_top_n = session["rerank_top_n"]
@@ -692,6 +750,7 @@ def activate_session(session_id: int) -> dict:
         "chunk_count": chunk_count,
         "chunk_size": session["chunk_size"],
         "chunk_overlap": session["chunk_overlap"],
+        "use_hybrid_search": session["use_hybrid_search"],
         "use_reranking": session["use_reranking"],
         "reranker_model": session["reranker_model"],
         "rerank_top_n": session["rerank_top_n"],
@@ -724,6 +783,7 @@ async def build_index(
     chunk_size: int = Form(1500),
     chunk_overlap: int = Form(100),
     temperature: float = Form(0.1),
+    use_hybrid_search: bool = Form(False),
     use_reranking: bool = Form(False),
     reranker_model: str = Form("cross-encoder/ms-marco-MiniLM-L-6-v2"),
     rerank_top_n: int = Form(10),
@@ -747,12 +807,18 @@ async def build_index(
                 detail=f"Invalid file type: {uploaded.filename}. Only PDF and DOCX are supported.",
             )
         content = await uploaded.read()
+        file_type = Path(uploaded.filename).suffix.lower().lstrip(".") or "unknown"
+        upload_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        doc_id = f"doc_{len(file_records) + 1}_{int(time.time() * 1000)}"
         doc_items.append((uploaded.filename, content))
         file_records.append(
             {
                 "file_name": uploaded.filename,
                 "file_size": len(content),
                 "content": content,
+                "doc_id": doc_id,
+                "upload_time": upload_time,
+                "file_type": file_type,
             }
         )
 
@@ -770,6 +836,7 @@ async def build_index(
         chunk_overlap=chunk_overlap,
         top_k=3,
         temperature=temperature,
+        use_hybrid_search=use_hybrid_search,
         use_reranking=use_reranking,
         reranker_model=reranker_model,
         rerank_top_n=rerank_top_n,
@@ -782,7 +849,19 @@ async def build_index(
     )
 
     try:
-        qa_chain, doc_language, chunk_count = build_rag_pipeline(doc_items, config)
+        qa_chain, doc_language, chunk_count = build_rag_pipeline(
+            doc_items,
+            config,
+            document_metadata=[
+                {
+                    "source": item["file_name"],
+                    "doc_id": item["doc_id"],
+                    "upload_time": item["upload_time"],
+                    "file_type": item["file_type"],
+                }
+                for item in file_records
+            ],
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -791,6 +870,7 @@ async def build_index(
     state.chunk_count = chunk_count
     state.chunk_size = chunk_size
     state.chunk_overlap = chunk_overlap
+    state.use_hybrid_search = use_hybrid_search
     state.use_reranking = use_reranking
     state.reranker_model = reranker_model
     state.rerank_top_n = rerank_top_n
@@ -812,6 +892,7 @@ async def build_index(
         ollama_model=ollama_model,
         embedding_model=embedding_model,
         temperature=temperature,
+        use_hybrid_search=use_hybrid_search,
         use_reranking=use_reranking,
         reranker_model=reranker_model,
         rerank_top_n=rerank_top_n,
@@ -829,6 +910,7 @@ async def build_index(
         "chunk_count": chunk_count,
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
+        "use_hybrid_search": use_hybrid_search,
         "use_reranking": use_reranking,
         "reranker_model": reranker_model if use_reranking else None,
         "rerank_top_n": rerank_top_n if use_reranking else None,
@@ -862,6 +944,7 @@ def ask(payload: AskPayload) -> dict:
                 max_hops=state.max_hops,
                 confidence_threshold=state.confidence_threshold,
                 top_k=3,
+                use_hybrid_search=state.use_hybrid_search,
                 use_reranking=state.use_reranking,
                 reranker_model=state.reranker_model,
                 rerank_top_n=state.rerank_top_n,
@@ -873,6 +956,7 @@ def ask(payload: AskPayload) -> dict:
                 state.vectorstore,
                 self_rag_config,
                 conversation_history=state.conversation_history,
+                filter_metadata=payload.filter_metadata,
             )
         else:
             # Standard RAG
@@ -880,6 +964,7 @@ def ask(payload: AskPayload) -> dict:
                 state.qa_chain,
                 question,
                 conversation_history=state.conversation_history,
+                filter_metadata=payload.filter_metadata,
             )
             metadata = None
     except Exception as exc:
@@ -955,17 +1040,31 @@ def compare_retrieval(payload: AskPayload) -> dict:
             status_code=500,
             detail="Cannot access vectorstore from current QA chain configuration."
         )
+    if hasattr(state.qa_chain.retriever, "documents"):
+        documents = state.qa_chain.retriever.documents
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail="Cannot access document metadata from current QA chain configuration."
+        )
 
     # Create config for comparison
     config = RAGConfig(
         top_k=3,
+        use_hybrid_search=state.use_hybrid_search,
         use_reranking=True,
         reranker_model=state.reranker_model,
         rerank_top_n=state.rerank_top_n,
     )
 
     try:
-        comparison = compare_retrieval_methods(vectorstore, question, config)
+        comparison = compare_retrieval_methods(
+            vectorstore,
+            documents,
+            question,
+            config,
+            filter_metadata=payload.filter_metadata,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -977,6 +1076,9 @@ def compare_retrieval(payload: AskPayload) -> dict:
             result.append({
                 "chunk_id": metadata.get("chunk_id", "?"),
                 "source": metadata.get("source", "unknown"),
+                "doc_id": metadata.get("doc_id"),
+                "upload_time": metadata.get("upload_time"),
+                "file_type": metadata.get("file_type"),
                 "page": metadata.get("page", "?"),
                 "preview": doc.page_content[:200].replace("\n", " ") + "...",
             })
@@ -988,6 +1090,12 @@ def compare_retrieval(payload: AskPayload) -> dict:
             "time_ms": comparison["bi_encoder"]["time_ms"],
             "num_docs": comparison["bi_encoder"]["num_docs"],
             "documents": format_docs(comparison["bi_encoder"]["docs"]),
+        },
+        "hybrid": {
+            "time_ms": comparison["hybrid"]["time_ms"],
+            "num_docs": comparison["hybrid"]["num_docs"],
+            "weights": comparison["hybrid"]["weights"],
+            "documents": format_docs(comparison["hybrid"]["docs"]),
         },
         "cross_encoder": {
             "time_ms": comparison["cross_encoder"]["time_ms"],
@@ -1029,6 +1137,7 @@ def clear_vector_store() -> dict:
     state.chunk_count = 0
     state.chunk_size = 1500
     state.chunk_overlap = 100
+    state.use_hybrid_search = False
     state.current_session_id = None
     state.conversation_history = []
 

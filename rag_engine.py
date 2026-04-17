@@ -5,17 +5,21 @@ from __future__ import annotations
 import os
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from langchain_classic.chains import RetrievalQA
 from langchain_core.documents import Document
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.prompts import PromptTemplate
 from langchain_core.retrievers import BaseRetriever
-from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from langchain.retrievers import EnsembleRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PDFPlumberLoader
+from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaLLM
@@ -39,6 +43,9 @@ class RAGConfig:
     use_reranking: bool = False
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     rerank_top_n: int = 10  # Retrieve more candidates for re-ranking
+    use_hybrid_search: bool = False
+    hybrid_semantic_weight: float = 0.7
+    hybrid_keyword_weight: float = 0.3
 
     # Self-RAG configuration
     use_self_rag: bool = False
@@ -59,13 +66,108 @@ def _validate_config(config: RAGConfig) -> None:
         raise ValueError("top_k phải lớn hơn 0.")
 
 
-def load_documents_from_files(file_items: Sequence[Tuple[str, bytes]]):
+def _default_upload_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _merge_document_metadata(
+    file_name: str,
+    *,
+    extra_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    ext = (os.path.splitext(file_name)[1] or "").lower().lstrip(".")
+    merged = dict(extra_metadata or {})
+    merged.setdefault("source", file_name)
+    merged.setdefault("upload_time", _default_upload_timestamp())
+    merged.setdefault("doc_id", str(uuid.uuid4()))
+    merged.setdefault("file_type", ext or "unknown")
+    return merged
+
+
+def _normalize_filter_values(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = [value]
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def _sanitize_filter_metadata(
+    filter_metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    if not filter_metadata:
+        return None
+
+    sanitized: Dict[str, Any] = {}
+    for key in ("source", "doc_id"):
+        values = _normalize_filter_values(filter_metadata.get(key))
+        if not values:
+            continue
+        sanitized[key] = values if len(values) > 1 else values[0]
+    return sanitized or None
+
+
+def metadata_matches_filter(
+    metadata: Optional[Dict[str, Any]],
+    filter_metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    normalized_filter = _sanitize_filter_metadata(filter_metadata)
+    if not normalized_filter:
+        return True
+
+    doc_metadata = metadata or {}
+    for key, expected in normalized_filter.items():
+        actual = doc_metadata.get(key)
+        if isinstance(expected, list):
+            if str(actual) not in {str(item) for item in expected}:
+                return False
+        elif str(actual) != str(expected):
+            return False
+    return True
+
+
+def filter_documents_by_metadata(
+    documents: Sequence[Document],
+    filter_metadata: Optional[Dict[str, Any]] = None,
+) -> List[Document]:
+    normalized_filter = _sanitize_filter_metadata(filter_metadata)
+    if not normalized_filter:
+        return list(documents)
+    return [
+        doc
+        for doc in documents
+        if metadata_matches_filter(getattr(doc, "metadata", None), normalized_filter)
+    ]
+
+
+def _similarity_search_with_optional_filter(
+    vectorstore: FAISS,
+    query: str,
+    *,
+    k: int,
+    filter_metadata: Optional[Dict[str, Any]] = None,
+) -> List[Document]:
+    search_filter = _sanitize_filter_metadata(filter_metadata)
+    if search_filter:
+        return vectorstore.similarity_search(query, k=k, filter=search_filter)
+    return vectorstore.similarity_search(query, k=k)
+
+
+def load_documents_from_files(
+    file_items: Sequence[Tuple[str, bytes]],
+    document_metadata: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
+):
     """Load documents from supported document bytes (PDF, DOCX)."""
 
     documents = []
     temp_paths: List[str] = []
     try:
-        for file_name, file_bytes in file_items:
+        metadata_items = list(document_metadata or [])
+        for index, (file_name, file_bytes) in enumerate(file_items):
+            base_metadata = metadata_items[index] if index < len(metadata_items) else None
+            merged_metadata = _merge_document_metadata(file_name, extra_metadata=base_metadata)
             suffix = os.path.splitext(file_name)[1] or ".pdf"
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(file_bytes)
@@ -83,7 +185,7 @@ def load_documents_from_files(file_items: Sequence[Tuple[str, bytes]]):
 
             for doc in loaded_docs:
                 doc.metadata = doc.metadata or {}
-                doc.metadata["source"] = file_name
+                doc.metadata.update(merged_metadata)
 
             documents.extend(loaded_docs)
 
@@ -217,7 +319,9 @@ class RerankingRetriever(BaseRetriever):
     """Custom retriever that performs re-ranking with a cross-encoder."""
 
     vectorstore: FAISS
+    documents: List[Document]
     config: RAGConfig
+    filter_metadata: Optional[Dict[str, Any]] = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -229,8 +333,15 @@ class RerankingRetriever(BaseRetriever):
         # Retrieve more candidates if re-ranking is enabled
         k = self.config.rerank_top_n if self.config.use_reranking else self.config.top_k
 
+        search_filter = _sanitize_filter_metadata(self.filter_metadata)
         # Get initial candidates using bi-encoder (FAISS)
-        initial_docs = self.vectorstore.similarity_search(query, k=k)
+        initial_docs = _similarity_search_with_optional_filter(
+            self.vectorstore,
+            query,
+            k=k,
+            filter_metadata=search_filter,
+        )
+        initial_docs = filter_documents_by_metadata(initial_docs, search_filter)
 
         if not self.config.use_reranking or not initial_docs:
             return initial_docs[: self.config.top_k]
@@ -238,6 +349,73 @@ class RerankingRetriever(BaseRetriever):
         # Re-rank using cross-encoder
         reranked_docs = rerank_documents(query, initial_docs, self.config)
         return reranked_docs
+
+
+class VectorSearchRetriever(BaseRetriever):
+    """Vector retriever with optional metadata filtering."""
+
+    vectorstore: FAISS
+    documents: List[Document]
+    config: RAGConfig
+    filter_metadata: Optional[Dict[str, Any]] = None
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: Optional[CallbackManagerForRetrieverRun] = None
+    ) -> List[Document]:
+        search_filter = _sanitize_filter_metadata(self.filter_metadata)
+        docs = _similarity_search_with_optional_filter(
+            self.vectorstore,
+            query,
+            k=self.config.top_k,
+            filter_metadata=search_filter,
+        )
+        return filter_documents_by_metadata(docs, search_filter)[: self.config.top_k]
+
+
+class HybridSearchRetriever(BaseRetriever):
+    """Hybrid retriever that combines FAISS semantic search with BM25 keyword search."""
+
+    vectorstore: FAISS
+    documents: List[Document]
+    config: RAGConfig
+    filter_metadata: Optional[Dict[str, Any]] = None
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: Optional[CallbackManagerForRetrieverRun] = None
+    ) -> List[Document]:
+        filtered_documents = filter_documents_by_metadata(self.documents, self.filter_metadata)
+        if not filtered_documents:
+            return []
+
+        candidate_k = self.config.rerank_top_n if self.config.use_reranking else self.config.top_k
+        semantic_config = RAGConfig(**{**self.config.__dict__, "top_k": candidate_k})
+        semantic_retriever = VectorSearchRetriever(
+            vectorstore=self.vectorstore,
+            documents=self.documents,
+            config=semantic_config,
+            filter_metadata=self.filter_metadata,
+        )
+
+        keyword_retriever = BM25Retriever.from_documents(filtered_documents)
+        keyword_retriever.k = candidate_k
+
+        hybrid_retriever = EnsembleRetriever(
+            retrievers=[semantic_retriever, keyword_retriever],
+            weights=[self.config.hybrid_semantic_weight, self.config.hybrid_keyword_weight],
+        )
+
+        combined_docs = list(hybrid_retriever.invoke(query) or [])
+        combined_docs = filter_documents_by_metadata(combined_docs, self.filter_metadata)
+        if not self.config.use_reranking or not combined_docs:
+            return combined_docs[: self.config.top_k]
+
+        return rerank_documents(query, combined_docs[:candidate_k], self.config)
 
 
 def rerank_documents(
@@ -316,7 +494,7 @@ Answer:
     return PromptTemplate(template=template, input_variables=["context", "question"])
 
 
-def build_qa_chain(vectorstore: FAISS, config: RAGConfig) -> RetrievalQA:
+def build_qa_chain(vectorstore: FAISS, chunks: List[Document], config: RAGConfig) -> RetrievalQA:
     llm = OllamaLLM(
         model=config.ollama_model,
         temperature=config.temperature,
@@ -327,11 +505,12 @@ def build_qa_chain(vectorstore: FAISS, config: RAGConfig) -> RetrievalQA:
     )
     prompt = _build_prompt()
 
-    # Use custom re-ranking retriever if enabled, otherwise use default FAISS retriever
-    if config.use_reranking:
-        retriever = RerankingRetriever(vectorstore=vectorstore, config=config)
+    if config.use_hybrid_search:
+        retriever = HybridSearchRetriever(vectorstore=vectorstore, documents=chunks, config=config)
+    elif config.use_reranking:
+        retriever = RerankingRetriever(vectorstore=vectorstore, documents=chunks, config=config)
     else:
-        retriever = vectorstore.as_retriever(search_kwargs={"k": config.top_k})
+        retriever = VectorSearchRetriever(vectorstore=vectorstore, documents=chunks, config=config)
 
     return RetrievalQA.from_chain_type(
         llm=llm,
@@ -343,15 +522,17 @@ def build_qa_chain(vectorstore: FAISS, config: RAGConfig) -> RetrievalQA:
 
 
 def build_rag_pipeline(
-    file_items: Sequence[Tuple[str, bytes]], config: RAGConfig
+    file_items: Sequence[Tuple[str, bytes]],
+    config: RAGConfig,
+    document_metadata: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
 ) -> Tuple[RetrievalQA, str, int]:
     _validate_config(config)
-    documents = load_documents_from_files(file_items)
+    documents = load_documents_from_files(file_items, document_metadata=document_metadata)
     language = detect_main_language(documents)
     chunks = split_documents(documents, config)
 
     vectorstore = build_vectorstore(chunks, config)
-    qa_chain = build_qa_chain(vectorstore, config)
+    qa_chain = build_qa_chain(vectorstore, chunks, config)
     return qa_chain, language, len(chunks)
 
 
@@ -452,6 +633,34 @@ def _retrieve_documents(retriever: Any, query: str) -> List[Document]:
         return retriever.get_relevant_documents(query)
 
     raise AttributeError("Retriever does not support `invoke` or `get_relevant_documents`.")
+
+
+def _set_retriever_filter(
+    retriever: Any,
+    filter_metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    if not hasattr(retriever, "filter_metadata"):
+        return None
+    previous_filter = getattr(retriever, "filter_metadata", None)
+    retriever.filter_metadata = _sanitize_filter_metadata(filter_metadata)
+    return previous_filter
+
+
+def _restore_retriever_filter(retriever: Any, previous_filter: Optional[Dict[str, Any]]) -> None:
+    if hasattr(retriever, "filter_metadata"):
+        retriever.filter_metadata = previous_filter
+
+
+def _generate_answer_from_documents(
+    qa_chain: RetrievalQA,
+    question: str,
+    documents: Sequence[Document],
+) -> str:
+    llm = _extract_llm_from_qa_chain(qa_chain)
+    prompt = _build_prompt()
+    context = "\n\n".join((doc.page_content or "").strip() for doc in documents if doc.page_content)
+    prompt_text = prompt.format(context=context, question=question)
+    return llm.invoke(prompt_text).strip()
 
 
 def rewrite_query(
@@ -610,6 +819,8 @@ def multi_hop_retrieval(
     llm: OllamaLLM,
     config: RAGConfig,
     max_hops: int = 3,
+    filter_metadata: Optional[Dict[str, Any]] = None,
+    retriever: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Multi-hop reasoning: Iterative retrieval cho câu hỏi phức tạp.
@@ -629,15 +840,34 @@ def multi_hop_retrieval(
     all_documents = []
     hop_history = []
     current_query = original_query
+    search_filter = _sanitize_filter_metadata(filter_metadata)
 
     for hop in range(max_hops):
         # Retrieve documents for current query
-        if config.use_reranking:
+        if retriever is not None:
+            previous_filter = _set_retriever_filter(retriever, search_filter)
+            try:
+                hop_docs = _retrieve_documents(retriever, current_query)
+            finally:
+                _restore_retriever_filter(retriever, previous_filter)
+        elif config.use_reranking:
             # Use re-ranking if enabled
-            candidates = vectorstore.similarity_search(current_query, k=config.rerank_top_n)
+            candidates = _similarity_search_with_optional_filter(
+                vectorstore,
+                current_query,
+                k=config.rerank_top_n,
+                filter_metadata=search_filter,
+            )
+            candidates = filter_documents_by_metadata(candidates, search_filter)
             hop_docs = rerank_documents(current_query, candidates, config)
         else:
-            hop_docs = vectorstore.similarity_search(current_query, k=config.top_k)
+            hop_docs = _similarity_search_with_optional_filter(
+                vectorstore,
+                current_query,
+                k=config.top_k,
+                filter_metadata=search_filter,
+            )
+            hop_docs = filter_documents_by_metadata(hop_docs, search_filter)
 
         all_documents.extend(hop_docs)
 
@@ -710,25 +940,52 @@ Câu hỏi follow-up:
 
 def compare_retrieval_methods(
     vectorstore: FAISS,
+    documents: Sequence[Document],
     query: str,
     config: RAGConfig,
+    filter_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Compare bi-encoder (FAISS only) vs cross-encoder re-ranking performance.
+    Compare pure vector search, hybrid search, and optional re-ranking performance.
 
     Returns:
         Dictionary with comparison metrics and retrieved documents
     """
     start_time = time.time()
+    search_filter = _sanitize_filter_metadata(filter_metadata)
+
+    vector_retriever = VectorSearchRetriever(
+        vectorstore=vectorstore,
+        documents=list(documents),
+        config=config,
+        filter_metadata=search_filter,
+    )
+    hybrid_config = RAGConfig(**{**config.__dict__, "use_hybrid_search": True, "use_reranking": False})
+    hybrid_retriever = HybridSearchRetriever(
+        vectorstore=vectorstore,
+        documents=list(documents),
+        config=hybrid_config,
+        filter_metadata=search_filter,
+    )
 
     # Bi-encoder only retrieval
     bi_encoder_start = time.time()
-    bi_encoder_docs = vectorstore.similarity_search(query, k=config.top_k)
+    bi_encoder_docs = vector_retriever.invoke(query)
     bi_encoder_time = time.time() - bi_encoder_start
+
+    hybrid_start = time.time()
+    hybrid_docs = hybrid_retriever.invoke(query)
+    hybrid_time = time.time() - hybrid_start
 
     # Retrieve more candidates for re-ranking
     retrieval_start = time.time()
-    candidate_docs = vectorstore.similarity_search(query, k=config.rerank_top_n)
+    candidate_docs = _similarity_search_with_optional_filter(
+        vectorstore,
+        query,
+        k=config.rerank_top_n,
+        filter_metadata=search_filter,
+    )
+    candidate_docs = filter_documents_by_metadata(candidate_docs, search_filter)
     retrieval_time = time.time() - retrieval_start
 
     # Cross-encoder re-ranking
@@ -746,6 +1003,12 @@ def compare_retrieval_methods(
             "time_ms": round(bi_encoder_time * 1000, 2),
             "num_docs": len(bi_encoder_docs),
         },
+        "hybrid": {
+            "docs": hybrid_docs,
+            "time_ms": round(hybrid_time * 1000, 2),
+            "num_docs": len(hybrid_docs),
+            "weights": [config.hybrid_semantic_weight, config.hybrid_keyword_weight],
+        },
         "cross_encoder": {
             "docs": reranked_docs,
             "scores": rerank_scores,
@@ -759,8 +1022,41 @@ def compare_retrieval_methods(
             "total_time_ms": round(total_time * 1000, 2),
             "speedup": round(bi_encoder_time / (retrieval_time + rerank_time), 2),
             "overhead_ms": round((retrieval_time + rerank_time - bi_encoder_time) * 1000, 2),
+            "hybrid_overhead_ms": round((hybrid_time - bi_encoder_time) * 1000, 2),
+            "hybrid_vs_vector_ratio": round(hybrid_time / bi_encoder_time, 2) if bi_encoder_time else None,
         },
     }
+
+
+def _format_source_documents(documents: Sequence[Document], top_k: int) -> List[Dict[str, Any]]:
+    sources: List[Dict[str, Any]] = []
+    for doc in list(documents)[:top_k]:
+        metadata = doc.metadata or {}
+        context_text = (doc.page_content or "").strip()
+        start_pos = metadata.get("position_start", metadata.get("start_index"))
+        end_pos = metadata.get("position_end")
+        if end_pos is None and isinstance(start_pos, int):
+            end_pos = start_pos + len(context_text)
+
+        page_value = metadata.get("page", metadata.get("page_number", "?"))
+        page_value = _normalize_page_number(page_value, metadata)
+        highlight_text = _build_highlight_text(context_text)
+        sources.append(
+            {
+                "chunk_id": metadata.get("chunk_id", "?"),
+                "source": metadata.get("source", "unknown"),
+                "doc_id": metadata.get("doc_id"),
+                "upload_time": metadata.get("upload_time"),
+                "file_type": metadata.get("file_type"),
+                "page": page_value,
+                "position_start": start_pos,
+                "position_end": end_pos,
+                "preview": highlight_text.replace("\n", " "),
+                "highlight_text": highlight_text,
+                "context_text": context_text,
+            }
+        )
+    return sources
 
 
 def ask_question_with_self_rag(
@@ -769,6 +1065,7 @@ def ask_question_with_self_rag(
     vectorstore: FAISS,
     config: RAGConfig,
     conversation_history: Optional[Sequence[Tuple[str, str]]] = None,
+    filter_metadata: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     """
     Advanced RAG với Self-RAG capabilities.
@@ -787,6 +1084,7 @@ def ask_question_with_self_rag(
         "used_self_rag": config.use_self_rag,
         "query_rewriting": config.enable_query_rewriting,
         "multi_hop": config.enable_multi_hop,
+        "filter_metadata": _sanitize_filter_metadata(filter_metadata),
     }
 
     # Get LLM from qa_chain in a version-compatible way.
@@ -810,6 +1108,8 @@ def ask_question_with_self_rag(
             llm,
             config,
             max_hops=config.max_hops,
+            filter_metadata=filter_metadata,
+            retriever=qa_chain.retriever,
         )
 
         answer = multi_hop_result["final_answer"]
@@ -819,7 +1119,11 @@ def ask_question_with_self_rag(
     else:
         # Standard single-hop retrieval
         retriever = qa_chain.retriever
-        retrieved_docs = _retrieve_documents(retriever, working_query)
+        previous_filter = _set_retriever_filter(retriever, filter_metadata)
+        try:
+            retrieved_docs = _retrieve_documents(retriever, working_query)
+        finally:
+            _restore_retriever_filter(retriever, previous_filter)
 
         # Generate answer using qa_chain
         question_lang = detect_question_language(question)
@@ -834,8 +1138,10 @@ def ask_question_with_self_rag(
             f"Recent conversation:\n{chat_history}"
         )
 
-        result = qa_chain.invoke({"query": augmented_question})
-        answer = _normalize_unknown_answer(result.get("result", ""), question_lang)
+        answer = _normalize_unknown_answer(
+            _generate_answer_from_documents(qa_chain, augmented_question, retrieved_docs),
+            question_lang,
+        )
         metadata["multi_hop"] = None
 
     # Step 3: Self-evaluation (if enabled)
@@ -855,38 +1161,14 @@ def ask_question_with_self_rag(
     else:
         metadata["evaluation"] = None
 
-    # Step 4: Format sources
-    sources = []
-    for doc in retrieved_docs[:config.top_k]:  # Limit to top_k for display
-        doc_metadata = doc.metadata or {}
-        context_text = (doc.page_content or "").strip()
-        start_pos = doc_metadata.get("position_start", doc_metadata.get("start_index"))
-        end_pos = doc_metadata.get("position_end")
-        if end_pos is None and isinstance(start_pos, int):
-            end_pos = start_pos + len(context_text)
-
-        page_value = doc_metadata.get("page", doc_metadata.get("page_number", "?"))
-        page_value = _normalize_page_number(page_value, doc_metadata)
-        highlight_text = _build_highlight_text(context_text)
-
-        sources.append({
-            "chunk_id": doc_metadata.get("chunk_id", "?"),
-            "source": doc_metadata.get("source", "unknown"),
-            "page": page_value,
-            "position_start": start_pos,
-            "position_end": end_pos,
-            "preview": highlight_text.replace("\n", " "),
-            "highlight_text": highlight_text,
-            "context_text": context_text,
-        })
-
-    return answer, sources, metadata
+    return answer, _format_source_documents(retrieved_docs, config.top_k), metadata
 
 
 def ask_question(
     qa_chain: RetrievalQA,
     question: str,
     conversation_history: Optional[Sequence[Tuple[str, str]]] = None,
+    filter_metadata: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     question_lang = detect_question_language(question)
     response_language = "Vietnamese" if question_lang == "vi" else "English"
@@ -899,10 +1181,17 @@ def ask_question(
         f"Recent conversation:\n{chat_history}"
     )
 
+    retriever = qa_chain.retriever
+    previous_filter = _set_retriever_filter(retriever, filter_metadata)
+    try:
+        docs = _retrieve_documents(retriever, question)
+    finally:
+        _restore_retriever_filter(retriever, previous_filter)
+
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            result = qa_chain.invoke({"query": augmented_question})
+            answer = _generate_answer_from_documents(qa_chain, augmented_question, docs)
             break
         except Exception as exc:
             last_error = exc
@@ -913,32 +1202,6 @@ def ask_question(
     else:
         raise RuntimeError("Không thể sinh câu trả lời từ Ollama.") from last_error
 
-    answer = _normalize_unknown_answer(result.get("result", ""), question_lang)
-    docs = result.get("source_documents", [])
+    answer = _normalize_unknown_answer(answer, question_lang)
 
-    sources: List[Dict[str, Any]] = []
-    for doc in docs:
-        metadata = doc.metadata or {}
-        context_text = (doc.page_content or "").strip()
-        start_pos = metadata.get("position_start", metadata.get("start_index"))
-        end_pos = metadata.get("position_end")
-        if end_pos is None and isinstance(start_pos, int):
-            end_pos = start_pos + len(context_text)
-
-        page_value = metadata.get("page", metadata.get("page_number", "?"))
-        page_value = _normalize_page_number(page_value, metadata)
-        highlight_text = _build_highlight_text(context_text)
-        sources.append(
-            {
-                "chunk_id": metadata.get("chunk_id", "?"),
-                "source": metadata.get("source", "unknown"),
-                "page": page_value,
-                "position_start": start_pos,
-                "position_end": end_pos,
-                "preview": highlight_text.replace("\n", " "),
-                "highlight_text": highlight_text,
-                "context_text": context_text,
-            }
-        )
-
-    return answer, sources
+    return answer, _format_source_documents(docs, len(docs))

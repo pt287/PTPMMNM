@@ -1,0 +1,69 @@
+You are a senior AI engineer working on an existing RAG system.
+
+Your task is to EXTEND the system with new features WITHOUT breaking anything.
+
+STRICT RULES:
+- DO NOT modify UI layout (Streamlit components must remain unchanged)
+- DO NOT break existing FAISS vector store structure
+- DO NOT remove or refactor existing working features
+- ONLY extend functionality in a modular way
+- Follow existing coding style and architecture
+
+TARGET FEATURES:
+1. Hybrid Search (Question 8.2.7)
+2. Multi-document RAG with metadata filtering (Question 8.2.8)
+
+----------------------------------------
+FEATURE 1: HYBRID SEARCH
+----------------------------------------
+- Combine:
+  + Semantic search (existing FAISS)
+  + Keyword search (BM25Retriever)
+
+- Use LangChain:
+  - BM25Retriever
+  - EnsembleRetriever
+
+- Combine scores:
+  weights = [0.7 (semantic), 0.3 (keyword)]
+
+- DO NOT replace existing retriever
+- Wrap it into a new retriever called:
+  hybrid_retriever
+
+----------------------------------------
+FEATURE 2: MULTI-DOCUMENT + METADATA
+----------------------------------------
+- Support multiple file uploads
+- Each document must include metadata:
+  {
+    "source": filename,
+    "upload_time": timestamp,
+    "doc_id": unique_id
+  }
+
+- Modify document loading:
+  - When splitting documents → attach metadata to chunks
+
+- Modify retrieval:
+  - Allow filtering by:
+    - source
+    - doc_id
+
+- Add optional filter parameter:
+  filter_metadata=None
+
+- If filter is provided → apply filtering before retrieval
+
+----------------------------------------
+OUTPUT REQUIREMENTS
+----------------------------------------
+1. Show FULL code changes (only modified/new parts)
+2. Add comments explaining logic
+3. Keep code clean and production-ready
+4. Provide example usage
+
+FINAL LINE MUST BE:
+TÔI ĐÃ HOÀN THÀNH CÔNG VIỆC ĐƯỢC GIAO
+
+If you are unsure about any part, DO NOT GUESS. Ask or preserve existing behavior.
