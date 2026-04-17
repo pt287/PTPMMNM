@@ -14,8 +14,6 @@ const citationModal = document.getElementById("citation-modal");
 const citationCloseButton = document.getElementById("close-citation");
 const citationTitle = document.getElementById("citation-title");
 const citationMeta = document.getElementById("citation-meta");
-const citationPdfWrap = document.getElementById("citation-pdf-wrap");
-const citationPdfFrame = document.getElementById("citation-pdf-frame");
 const citationContext = document.getElementById("citation-context");
 const appGrid = document.getElementById("app-grid");
 const systemStatus = document.getElementById("system-status");
@@ -378,37 +376,20 @@ function escapeRegExp(input) {
   return String(input || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function buildPdfSearchTerm(text) {
-  const normalized = String(text || "")
-    .replace(/\s+/g, " ")
-    .replace(/[\n\r\t]/g, " ")
-    .trim();
-
-  if (!normalized) {
-    return "";
-  }
-
-  const words = normalized
-    .replace(/[.,;:!?()[\]{}"'`~@#$%^&*_+=<>|\\/]/g, " ")
-    .split(" ")
-    .map((w) => w.trim())
-    .filter(Boolean);
-
-  return words.slice(0, 12).join(" ");
-}
-
 function renderCitationContext(contextText, highlightText) {
   const safeContext = String(contextText || "").trim();
   if (!safeContext) {
     return `<p class="citation-empty">${escapeHtml(t("sourceNoContext"))}</p>`;
   }
 
-  const marker = String(highlightText || "").trim();
+  let marker = String(highlightText || "").trim();
+  marker = marker.replace(/\.{3}$/g, "").trim();
   if (!marker) {
     return escapeHtml(safeContext);
   }
 
-  const pattern = new RegExp(escapeRegExp(marker), "i");
+  const normalizedMarker = marker.replace(/\s+/g, " ");
+  const pattern = new RegExp(escapeRegExp(normalizedMarker), "i");
   const match = pattern.exec(safeContext);
   if (!match) {
     return escapeHtml(safeContext);
@@ -435,34 +416,19 @@ function openCitationModal(source) {
   citationTitle.textContent = `${t("sourceChunkLabel")} ${source.chunk_id} | ${source.source}`;
   citationMeta.textContent = `${t("sourcePageLabel")}: ${pageText} | ${t("sourcePositionLabel")}: ${positionText}`;
 
-  const contextText = source.context_text || source.preview || "";
-  const highlightText = source.highlight_text || source.preview || "";
+  const contextText = String(source.context_text || "").trim();
+  const previewText = String(source.preview || "").trim();
+  const contentText = contextText || previewText;
+  const highlightText = source.highlight_text || previewText;
   citationContext.style.display = "block";
-  citationContext.innerHTML = renderCitationContext(contextText, highlightText);
-
-  const sourceName = String(source.source || "");
-  const isPdfSource = sourceName.toLowerCase().endsWith(".pdf");
-
-  if (isPdfSource && activeSessionId) {
-    const safeFile = encodeURIComponent(sourceName);
-    const searchTerm = buildPdfSearchTerm(highlightText || contextText || "");
-    const safeSearch = encodeURIComponent(searchTerm);
-    const pageNumber = Number.isInteger(source.page) ? source.page : 1;
-    citationPdfFrame.src = `/api/sessions/${activeSessionId}/file?file_name=${safeFile}#page=${pageNumber}&zoom=page-width&search=${safeSearch}`;
-    citationPdfWrap.classList.add("show");
-    citationContext.style.display = "none";
-  } else {
-    citationPdfFrame.src = "about:blank";
-    citationPdfWrap.classList.remove("show");
-    citationContext.style.display = "block";
-  }
+  citationContext.scrollTop = 0;
+  citationContext.innerHTML = renderCitationContext(contentText, highlightText);
 
   citationModal.classList.add("show");
   citationModal.setAttribute("aria-hidden", "false");
 }
 
 function closeCitationModal() {
-  citationPdfFrame.src = "about:blank";
   citationModal.classList.remove("show");
   citationModal.setAttribute("aria-hidden", "true");
 }

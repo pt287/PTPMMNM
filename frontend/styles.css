@@ -618,34 +618,14 @@ select:focus {
 }
 
 .citation-dialog {
-  width: min(1220px, calc(100vw - 16px));
+  width: min(980px, calc(100vw - 16px));
   max-height: calc(100vh - 16px);
   display: flex;
   flex-direction: column;
 }
 
-.citation-pdf-wrap {
-  display: none;
-  border: 1px solid #d9e2eb;
-  border-radius: 10px;
-  overflow: hidden;
-  margin-bottom: 10px;
-  background: #f6f9fc;
-}
-
-.citation-pdf-wrap.show {
-  display: block;
-}
-
-.citation-pdf-frame {
-  width: 100%;
-  height: min(76vh, 900px);
-  border: 0;
-  background: #ffffff;
-}
-
 .citation-context {
-  max-height: min(60vh, 520px);
+  max-height: min(72vh, 760px);
   overflow: auto;
   white-space: pre-wrap;
   line-height: 1.5;
