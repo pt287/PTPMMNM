@@ -1070,7 +1070,6 @@ def _retrieve_documents(retriever: Any, query: str) -> List[Document]:
     raise AttributeError("Retriever does not support `invoke` or `get_relevant_documents`.")
 
 
-<<<<<<< HEAD
 def _set_retriever_filter(
     retriever: Any,
     filter_metadata: Optional[Dict[str, Any]] = None,
@@ -1087,17 +1086,6 @@ def _restore_retriever_filter(retriever: Any, previous_filter: Optional[Dict[str
         retriever.filter_metadata = previous_filter
 
 
-def _generate_answer_from_documents(
-    qa_chain: RetrievalQA,
-    question: str,
-    documents: Sequence[Document],
-) -> str:
-    llm = _extract_llm_from_qa_chain(qa_chain)
-    prompt = _build_prompt()
-    context = "\n\n".join((doc.page_content or "").strip() for doc in documents if doc.page_content)
-    prompt_text = prompt.format(context=context, question=question)
-    return llm.invoke(prompt_text).strip()
-=======
 def _translate_query_for_retrieval(
     query: str,
     source_lang: str,
@@ -1186,7 +1174,6 @@ def _retrieve_documents_cross_language(
         merged_docs = rerank_documents(rerank_query, merged_docs, cfg)
 
     return merged_docs, queries
->>>>>>> 4f4b4d3681a247c2e70f9b2a946cdf3fc99bd6fd
 
 
 def rewrite_query(
@@ -1594,11 +1581,8 @@ def ask_question_with_self_rag(
     vectorstore: FAISS,
     config: RAGConfig,
     conversation_history: Optional[Sequence[Tuple[str, str]]] = None,
-<<<<<<< HEAD
     filter_metadata: Optional[Dict[str, Any]] = None,
-=======
     doc_language: str = "unknown",
->>>>>>> 4f4b4d3681a247c2e70f9b2a946cdf3fc99bd6fd
 ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     """
     Advanced RAG với Self-RAG capabilities.
@@ -1628,7 +1612,7 @@ def ask_question_with_self_rag(
     working_query = contextualized["standalone"]
     metadata["contextualization"] = contextualized
 
-    # Step 2: Query Rewriting (if enabled)
+    # Step 2: Query rewriting (if enabled)
     if config.use_self_rag and config.enable_query_rewriting:
         rewrite_result = rewrite_query(
             working_query,
@@ -1640,9 +1624,10 @@ def ask_question_with_self_rag(
     else:
         metadata["query_rewrite"] = None
 
-    # Step 3: Retrieval (Multi-hop or single)
+    # Step 3: Retrieval (multi-hop or single-hop)
+    question_lang = resolve_response_language(question, doc_language)
+
     if config.use_self_rag and config.enable_multi_hop:
-        # Multi-hop retrieval
         multi_hop_result = multi_hop_retrieval(
             working_query,
             vectorstore,
@@ -1652,153 +1637,80 @@ def ask_question_with_self_rag(
             filter_metadata=filter_metadata,
             retriever=qa_chain.retriever,
         )
-
         retrieved_docs = _deduplicate_documents(multi_hop_result["all_documents"])
-        answer = _generate_answer_from_documents(
-            llm,
-            question,
-            retrieved_docs,
-            resolve_response_language(question, doc_language),
-            doc_language,
-            conversation_history,
-        )
         metadata["multi_hop"] = multi_hop_result
-
+        metadata["retrieval_queries"] = [working_query]
     else:
-        # Standard single-hop retrieval
         retriever = qa_chain.retriever
-<<<<<<< HEAD
         previous_filter = _set_retriever_filter(retriever, filter_metadata)
         try:
-            retrieved_docs = _retrieve_documents(retriever, working_query)
+            retrieved_docs, used_queries = _retrieve_documents_cross_language(
+                retriever,
+                working_query,
+                question_lang,
+                doc_language,
+                llm,
+            )
         finally:
             _restore_retriever_filter(retriever, previous_filter)
 
-        # Generate answer using qa_chain
-        question_lang = detect_question_language(question)
-        response_language = "Vietnamese" if question_lang == "vi" else "English"
-        unknown_phrase = _unknown_phrase_for_language(question_lang)
-        chat_history = _format_recent_history(conversation_history)
-
-        augmented_question = (
-            f"User question: {working_query}\n"
-            f"Response language: {response_language}\n"
-            f"Fallback when missing context: {unknown_phrase}\n"
-            f"Recent conversation:\n{chat_history}"
-=======
-        question_lang = resolve_response_language(question, doc_language)
-        retrieved_docs, used_queries = _retrieve_documents_cross_language(
-            retriever,
-            working_query,
-            question_lang,
-            doc_language,
-            llm,
->>>>>>> 4f4b4d3681a247c2e70f9b2a946cdf3fc99bd6fd
-        )
+        metadata["multi_hop"] = None
         metadata["retrieval_queries"] = used_queries
 
-<<<<<<< HEAD
-        answer = _normalize_unknown_answer(
-            _generate_answer_from_documents(qa_chain, augmented_question, retrieved_docs),
-            question_lang,
-=======
-        # Generate answer with context + recent conversation memory
-        answer = _generate_answer_from_documents(
-            llm,
-            question,
-            retrieved_docs,
-            question_lang,
-            doc_language,
-            conversation_history,
->>>>>>> 4f4b4d3681a247c2e70f9b2a946cdf3fc99bd6fd
-        )
-        metadata["multi_hop"] = None
+    # Step 4: Generate answer with retrieved context + conversation memory
+    answer = _generate_answer_from_documents(
+        llm,
+        question,
+        list(retrieved_docs or []),
+        question_lang,
+        doc_language,
+        conversation_history,
+    )
 
-    # Step 4: Self-evaluation (if enabled)
+    # Step 5: Self-evaluation (if enabled)
     if config.use_self_rag:
         evaluation = evaluate_answer_quality(
             question,
             answer,
-            retrieved_docs,
+            list(retrieved_docs or []),
             llm,
         )
         metadata["evaluation"] = evaluation
-
-        # Check confidence threshold
         if evaluation["confidence"] < config.confidence_threshold:
-            # Low confidence - could trigger retry or return with warning
             metadata["low_confidence_warning"] = True
     else:
         metadata["evaluation"] = None
 
-<<<<<<< HEAD
-    return answer, _format_source_documents(retrieved_docs, config.top_k), metadata
-=======
-    # Step 5: Format sources
-    sources = []
-    for doc in retrieved_docs[:config.top_k]:  # Limit to top_k for display
-        doc_metadata = doc.metadata or {}
-        context_text = (doc.page_content or "").strip()
-        start_pos = doc_metadata.get("position_start", doc_metadata.get("start_index"))
-        end_pos = doc_metadata.get("position_end")
-        if end_pos is None and isinstance(start_pos, int):
-            end_pos = start_pos + len(context_text)
-
-        page_value = doc_metadata.get("page", doc_metadata.get("page_number", "?"))
-        page_value = _normalize_page_number(page_value, doc_metadata)
-        highlight_text = _build_highlight_text(context_text)
-
-        sources.append({
-            "chunk_id": doc_metadata.get("chunk_id", "?"),
-            "source": doc_metadata.get("source", "unknown"),
-            "page": page_value,
-            "position_start": start_pos,
-            "position_end": end_pos,
-            "preview": highlight_text.replace("\n", " "),
-            "highlight_text": highlight_text,
-            "context_text": context_text,
-        })
-
-    return answer, sources, metadata
->>>>>>> 4f4b4d3681a247c2e70f9b2a946cdf3fc99bd6fd
+    return answer, _format_source_documents(list(retrieved_docs or []), config.top_k), metadata
 
 
 def ask_question(
     qa_chain: RetrievalQA,
     question: str,
     conversation_history: Optional[Sequence[Tuple[str, str]]] = None,
-<<<<<<< HEAD
     filter_metadata: Optional[Dict[str, Any]] = None,
-=======
     doc_language: str = "unknown",
->>>>>>> 4f4b4d3681a247c2e70f9b2a946cdf3fc99bd6fd
 ) -> Tuple[str, List[Dict[str, Any]]]:
     question_lang = resolve_response_language(question, doc_language)
     llm = _extract_llm_from_qa_chain(qa_chain)
     contextualized = contextualize_question(question, llm, conversation_history)
     retrieval_query = contextualized["standalone"]
 
-    retriever = qa_chain.retriever
-    previous_filter = _set_retriever_filter(retriever, filter_metadata)
-    try:
-        docs = _retrieve_documents(retriever, question)
-    finally:
-        _restore_retriever_filter(retriever, previous_filter)
-
     last_error: Exception | None = None
+    docs: List[Document] = []
     for attempt in range(2):
         try:
-<<<<<<< HEAD
-            answer = _generate_answer_from_documents(qa_chain, augmented_question, docs)
-=======
-            docs, _used_queries = _retrieve_documents_cross_language(
-                qa_chain.retriever,
-                retrieval_query,
-                question_lang,
-                doc_language,
-                llm,
-            )
->>>>>>> 4f4b4d3681a247c2e70f9b2a946cdf3fc99bd6fd
+            previous_filter = _set_retriever_filter(qa_chain.retriever, filter_metadata)
+            try:
+                docs, _used_queries = _retrieve_documents_cross_language(
+                    qa_chain.retriever,
+                    retrieval_query,
+                    question_lang,
+                    doc_language,
+                    llm,
+                )
+            finally:
+                _restore_retriever_filter(qa_chain.retriever, previous_filter)
             break
         except Exception as exc:
             last_error = exc
@@ -1809,18 +1721,14 @@ def ask_question(
     else:
         raise RuntimeError("Không thể sinh câu trả lời từ Ollama.") from last_error
 
-<<<<<<< HEAD
-    answer = _normalize_unknown_answer(answer, question_lang)
-=======
     docs = _deduplicate_documents(list(docs or []))
     answer = _generate_answer_from_documents(
         llm,
         question,
-        docs,
+        list(docs or []),
         question_lang,
         doc_language,
         conversation_history,
     )
->>>>>>> 4f4b4d3681a247c2e70f9b2a946cdf3fc99bd6fd
 
     return answer, _format_source_documents(docs, len(docs))

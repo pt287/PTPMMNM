@@ -973,11 +973,8 @@ def ask(payload: AskPayload) -> dict:
                 state.vectorstore,
                 self_rag_config,
                 conversation_history=state.conversation_history,
-<<<<<<< HEAD
                 filter_metadata=payload.filter_metadata,
-=======
                 doc_language=state.doc_language,
->>>>>>> 4f4b4d3681a247c2e70f9b2a946cdf3fc99bd6fd
             )
         else:
             # Standard RAG
@@ -985,11 +982,8 @@ def ask(payload: AskPayload) -> dict:
                 state.qa_chain,
                 question,
                 conversation_history=state.conversation_history,
-<<<<<<< HEAD
                 filter_metadata=payload.filter_metadata,
-=======
                 doc_language=state.doc_language,
->>>>>>> 4f4b4d3681a247c2e70f9b2a946cdf3fc99bd6fd
             )
             metadata = None
     except Exception as exc:
