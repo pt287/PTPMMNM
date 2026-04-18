@@ -2,6 +2,12 @@ const buildForm = document.getElementById("build-form");
 const askForm = document.getElementById("ask-form");
 const chat = document.getElementById("chat");
 const questionInput = document.getElementById("question");
+const filesInput = document.getElementById("pdf-files");
+const selectedFilesSummary = document.getElementById("selected-files-summary");
+const selectedFilesPanel = document.getElementById("selected-files-panel");
+const selectedFilesTitle = document.getElementById("selected-files-title");
+const selectedFilesList = document.getElementById("selected-files-list");
+const clearSelectedFilesButton = document.getElementById("clear-selected-files");
 const clearChatButton = document.getElementById("clear-chat");
 const clearHistoryButton = document.getElementById("clear-history");
 const clearVectorStoreButton = document.getElementById("clear-vector-store");
@@ -248,6 +254,7 @@ let activeSessionId = null;
 let latestSessionId = null;
 let isHistoryCollapsed = localStorage.getItem("smartdoc_history_collapsed") === "1";
 let isGuideDismissed = localStorage.getItem("smartdoc_guide_dismissed") === "1";
+let selectedBuildFiles = [];
 
 function t(key) {
   return translations[currentLanguage][key] || translations.vi[key] || key;
@@ -273,12 +280,24 @@ function applyTranslations() {
     element.setAttribute("placeholder", t(key));
   });
 
+  document.querySelectorAll("[data-i18n-title]").forEach((element) => {
+    const key = element.dataset.i18nTitle;
+    element.setAttribute("title", t(key));
+  });
+
+  document.querySelectorAll("[data-i18n-aria]").forEach((element) => {
+    const key = element.dataset.i18nAria;
+    element.setAttribute("aria-label", t(key));
+  });
+
   suggestionButtons.forEach((button) => {
     button.dataset.question = currentLanguage === "en" ? button.dataset.questionEn : button.dataset.questionVi;
   });
 
   if (historyToggleButton) {
-    historyToggleButton.textContent = isHistoryCollapsed ? t("expandHistory") : t("collapseHistory");
+    const historyLabel = isHistoryCollapsed ? t("expandHistory") : t("collapseHistory");
+    historyToggleButton.setAttribute("title", historyLabel);
+    historyToggleButton.setAttribute("aria-label", historyLabel);
   }
 
   if (hasIndexedData) {
@@ -290,6 +309,160 @@ function applyTranslations() {
   } else {
     setSystemStatus(true, t("systemReady"));
   }
+
+  updateSelectedFilesSummary();
+}
+
+function updateSelectedFilesSummary() {
+  if (!selectedFilesSummary) {
+    return;
+  }
+
+  const count = selectedBuildFiles.length;
+  if (currentLanguage === "vi") {
+    selectedFilesSummary.textContent = count === 0
+      ? "Đã chọn 0 tệp"
+      : `Đã chọn ${count} tệp`;
+  } else {
+    selectedFilesSummary.textContent = count === 0
+      ? "0 file selected"
+      : `${count} file(s) selected`;
+  }
+
+  renderSelectedFilesPanel();
+}
+
+function formatFileSize(bytes) {
+  const kb = Math.max(1, Math.round((Number(bytes) || 0) / 1024));
+  return `${kb} KB`;
+}
+
+function removeSelectedFileByIndex(index) {
+  if (index < 0 || index >= selectedBuildFiles.length) {
+    return;
+  }
+  selectedBuildFiles.splice(index, 1);
+  syncFileInputFromSelection();
+  updateSelectedFilesSummary();
+}
+
+function clearAllSelectedFiles() {
+  selectedBuildFiles = [];
+  filesInput.value = "";
+  syncFileInputFromSelection();
+  updateSelectedFilesSummary();
+}
+
+function renderSelectedFilesPanel() {
+  if (!selectedFilesPanel || !selectedFilesList || !selectedFilesTitle || !clearSelectedFilesButton) {
+    return;
+  }
+
+  const hasFiles = selectedBuildFiles.length > 0;
+  selectedFilesPanel.classList.toggle("show", hasFiles);
+  selectedFilesList.innerHTML = "";
+
+  if (currentLanguage === "vi") {
+    selectedFilesTitle.textContent = "Danh sách file đã chọn";
+    clearSelectedFilesButton.textContent = "Xóa tất cả";
+    clearSelectedFilesButton.setAttribute("aria-label", "Xóa tất cả file đã chọn");
+  } else {
+    selectedFilesTitle.textContent = "Selected files";
+    clearSelectedFilesButton.textContent = "Clear all";
+    clearSelectedFilesButton.setAttribute("aria-label", "Clear all selected files");
+  }
+
+  if (!hasFiles) {
+    return;
+  }
+
+  selectedBuildFiles.forEach((file, index) => {
+    const row = document.createElement("div");
+    row.className = "selected-file-item";
+
+    const meta = document.createElement("div");
+    meta.className = "selected-file-meta";
+
+    const name = document.createElement("p");
+    name.className = "selected-file-name";
+    name.textContent = file.name;
+    name.title = file.name;
+
+    const size = document.createElement("p");
+    size.className = "selected-file-size";
+    size.textContent = formatFileSize(file.size);
+
+    meta.appendChild(name);
+    meta.appendChild(size);
+
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.className = "btn-ghost small remove-selected-file";
+    removeButton.dataset.index = String(index);
+    if (currentLanguage === "vi") {
+      removeButton.setAttribute("title", "Xóa file");
+      removeButton.setAttribute("aria-label", `Xóa file ${file.name}`);
+    } else {
+      removeButton.setAttribute("title", "Remove file");
+      removeButton.setAttribute("aria-label", `Remove file ${file.name}`);
+    }
+    removeButton.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M19 6h-3.5l-1-1h-5l-1 1H5v2h14zm-1 3H6v10a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2z" fill="currentColor"/></svg>';
+
+    row.appendChild(meta);
+    row.appendChild(removeButton);
+    selectedFilesList.appendChild(row);
+  });
+}
+
+function fileKey(file) {
+  return `${file.name}|${file.size}|${file.lastModified}`;
+}
+
+function syncFileInputFromSelection() {
+  if (typeof DataTransfer === "undefined") {
+    return;
+  }
+
+  const dataTransfer = new DataTransfer();
+  selectedBuildFiles.forEach((file) => {
+    dataTransfer.items.add(file);
+  });
+  filesInput.files = dataTransfer.files;
+}
+
+function mergeSelectedFiles(newFiles) {
+  const merged = [...selectedBuildFiles];
+  const seen = new Set(merged.map(fileKey));
+  newFiles.forEach((file) => {
+    const key = fileKey(file);
+    if (!seen.has(key)) {
+      seen.add(key);
+      merged.push(file);
+    }
+  });
+  selectedBuildFiles = merged;
+  syncFileInputFromSelection();
+  updateSelectedFilesSummary();
+}
+
+function handleFileSelectionChange() {
+  const incomingFiles = Array.from(filesInput.files || []);
+  if (!incomingFiles.length) {
+    return;
+  }
+  mergeSelectedFiles(incomingFiles);
+}
+
+function handleSelectedFilesListClick(event) {
+  const button = event.target.closest(".remove-selected-file");
+  if (!button) {
+    return;
+  }
+
+  const index = Number(button.dataset.index);
+  if (Number.isInteger(index)) {
+    removeSelectedFileByIndex(index);
+  }
 }
 
 function setHistoryCollapsed(collapsed) {
@@ -297,7 +470,9 @@ function setHistoryCollapsed(collapsed) {
   appGrid.classList.toggle("sidebar-collapsed", isHistoryCollapsed);
   localStorage.setItem("smartdoc_history_collapsed", isHistoryCollapsed ? "1" : "0");
   if (historyToggleButton) {
-    historyToggleButton.textContent = isHistoryCollapsed ? t("expandHistory") : t("collapseHistory");
+    const historyLabel = isHistoryCollapsed ? t("expandHistory") : t("collapseHistory");
+    historyToggleButton.setAttribute("title", historyLabel);
+    historyToggleButton.setAttribute("aria-label", historyLabel);
   }
 }
 
@@ -468,6 +643,25 @@ function formatTimestamp(value) {
   return date.toLocaleString(currentLanguage === "vi" ? "vi-VN" : "en-US");
 }
 
+function formatHistoryTimestamp(value) {
+  if (!value) {
+    return "-";
+  }
+
+  const date = new Date(`${value}Z`);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  const locale = currentLanguage === "vi" ? "vi-VN" : "en-US";
+  return date.toLocaleString(locale, {
+    hour: "2-digit",
+    minute: "2-digit",
+    day: "numeric",
+    month: "numeric",
+  });
+}
+
 function createHistoryItem(title, subtitle, bodyLines = []) {
   const item = document.createElement("article");
   item.className = "history-item";
@@ -551,17 +745,32 @@ async function activateSession(sessionId) {
 }
 
 function attachHistoryActions(root, sessionId, qaContainer, toggleButton, continueButton) {
+  function updateConversationButtonState(isOpen) {
+    const label = isOpen
+      ? (currentLanguage === "vi" ? "Ẩn hội thoại" : "Hide conversation")
+      : (currentLanguage === "vi" ? "Xem hội thoại" : "View conversation");
+    toggleButton.classList.toggle("active", isOpen);
+    toggleButton.setAttribute("title", label);
+    toggleButton.setAttribute("aria-label", label);
+  }
+
+  updateConversationButtonState(false);
+
+  const continueLabel = currentLanguage === "vi" ? "Mở phiên này" : "Activate this session";
+  continueButton.setAttribute("title", continueLabel);
+  continueButton.setAttribute("aria-label", continueLabel);
+
   toggleButton.addEventListener("click", async () => {
     const isOpen = qaContainer.classList.contains("open");
     if (isOpen) {
       qaContainer.classList.remove("open");
       qaContainer.innerHTML = "";
-      toggleButton.textContent = t("viewConversation");
+      updateConversationButtonState(false);
       return;
     }
 
     qaContainer.classList.add("open");
-    toggleButton.textContent = t("hideConversation");
+    updateConversationButtonState(true);
     qaContainer.innerHTML = `<p class="history-empty">${t("statusGenerating")}</p>`;
 
     try {
@@ -614,35 +823,96 @@ function renderUploadHistory(items) {
   }
 
   items.forEach((entry) => {
-    const files = (entry.pdf_files || []).map((f) => `${f.file_name} (${Math.round(f.file_size / 1024)} KB)`);
-    const title = `${t("uploadLabel")} #${entry.session_id}`;
-    const activeTag = activeSessionId === entry.session_id ? ` | ${t("activeLabel")}` : "";
-    const subtitle = `${formatTimestamp(entry.created_at)} | ${entry.doc_language} | ${entry.chunk_count} chunks | cs=${entry.chunk_size}, ov=${entry.chunk_overlap}${activeTag}`;
-    const lines = [`${t("filesLabel")}: ${files.join(", ") || "-"}`];
+    const files = entry.pdf_files || [];
+    const firstFile = files[0]?.file_name || "-";
+    const extraFiles = Math.max(0, files.length - 1);
+    const primaryFileText = extraFiles > 0
+      ? `${firstFile} +${extraFiles}`
+      : firstFile;
 
-    const item = createHistoryItem(title, subtitle, lines);
+    const item = document.createElement("article");
+    item.className = "history-item";
     item.classList.toggle("active", activeSessionId === entry.session_id);
 
+    const row = document.createElement("div");
+    row.className = "history-row history-row-primary";
+
+    const main = document.createElement("div");
+    main.className = "history-main";
+
+    const index = document.createElement("span");
+    index.className = "history-index";
+    index.textContent = `#${entry.session_id}`;
+
+    const fileName = document.createElement("span");
+    fileName.className = "history-file-primary";
+    fileName.title = firstFile;
+    fileName.textContent = primaryFileText;
+
+    main.appendChild(index);
+    main.appendChild(fileName);
+
     const actionRow = document.createElement("div");
-    actionRow.className = "history-actions";
+    actionRow.className = "history-row history-row-secondary";
+
+    const secondaryMeta = document.createElement("span");
+    secondaryMeta.className = "history-time";
+    secondaryMeta.textContent = formatHistoryTimestamp(entry.created_at);
+
+    const infoButton = document.createElement("button");
+    infoButton.type = "button";
+    infoButton.className = "history-icon-btn history-tech-trigger";
+    infoButton.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M11 10h2v7h-2zm0-3h2v2h-2zm1-5a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z" fill="currentColor"/></svg>';
+
+    const infoLabel = currentLanguage === "vi" ? "Thông số kỹ thuật" : "Technical details";
+    infoButton.setAttribute("title", infoLabel);
+    infoButton.setAttribute("aria-label", infoLabel);
+
+    const techPanel = document.createElement("div");
+    techPanel.className = "history-tech-panel";
+    techPanel.innerHTML = `
+      <p class="history-tech-line"><strong>${currentLanguage === "vi" ? "File" : "Files"}:</strong> ${files.length}</p>
+      <p class="history-tech-line"><strong>Chunk:</strong> ${entry.chunk_count} | cs ${entry.chunk_size} | ov ${entry.chunk_overlap}</p>
+      <p class="history-tech-line"><strong>Model:</strong> ${entry.ollama_model}</p>
+      <p class="history-tech-line"><strong>${t("metricReranking")}:</strong> ${entry.use_reranking ? (currentLanguage === "vi" ? "Bật" : "On") : (currentLanguage === "vi" ? "Tắt" : "Off")}</p>
+      <p class="history-tech-line"><strong>${t("metricSelfRag")}:</strong> ${entry.use_self_rag ? (currentLanguage === "vi" ? "Bật" : "On") : (currentLanguage === "vi" ? "Tắt" : "Off")}</p>
+    `;
+
+    infoButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const isOpen = item.classList.contains("show-tech");
+      document.querySelectorAll(".history-item.show-tech").forEach((node) => {
+        node.classList.remove("show-tech");
+      });
+      item.classList.toggle("show-tech", !isOpen);
+    });
 
     const viewBtn = document.createElement("button");
     viewBtn.type = "button";
-    viewBtn.className = "btn-ghost small";
-    viewBtn.textContent = t("viewConversation");
+    viewBtn.className = "history-icon-btn";
+    viewBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 4h16v10H7l-3 3zm2 2v6.17L6.83 12H18V6z" fill="currentColor"/></svg>';
 
     const continueBtn = document.createElement("button");
     continueBtn.type = "button";
-    continueBtn.className = "btn-primary small";
-    continueBtn.textContent = t("continueThisFile");
+    continueBtn.className = "history-icon-btn primary";
+    continueBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>';
 
     const qaContainer = document.createElement("div");
     qaContainer.className = "session-qa-list";
 
-    actionRow.appendChild(viewBtn);
-    actionRow.appendChild(continueBtn);
+    const actionButtons = document.createElement("div");
+    actionButtons.className = "history-row-actions";
+    actionButtons.appendChild(infoButton);
+    actionButtons.appendChild(viewBtn);
+    actionButtons.appendChild(continueBtn);
 
+    actionRow.appendChild(secondaryMeta);
+    actionRow.appendChild(actionButtons);
+
+    row.appendChild(main);
+    item.appendChild(row);
     item.appendChild(actionRow);
+    item.appendChild(techPanel);
     item.appendChild(qaContainer);
     attachHistoryActions(item, entry.session_id, qaContainer, viewBtn, continueBtn);
 
@@ -708,9 +978,7 @@ async function buildIndex(event) {
   buildStatus.textContent = t("statusBuilding");
   startBuildProgress();
 
-  const filesInput = document.getElementById("pdf-files");
-
-  if (!filesInput.files.length) {
+  if (!selectedBuildFiles.length) {
     buildStatus.textContent = t("statusNeedPdf");
     buildProgressWrap.classList.remove("show");
     return;
@@ -723,7 +991,7 @@ async function buildIndex(event) {
   }, 180);
 
   const formData = new FormData();
-  for (const file of filesInput.files) {
+  for (const file of selectedBuildFiles) {
     formData.append("files", file);
   }
   formData.append("ollama_model", modelSelect.value);
@@ -771,6 +1039,7 @@ async function buildIndex(event) {
     } else {
       setSystemStatus(true, t("systemIndexed"));
     }
+    clearAllSelectedFiles();
     loadHistory();
     clearInterval(progressTimer);
     stopBuildProgress();
@@ -896,7 +1165,7 @@ async function clearVectorStore() {
     metricChunkOverlap.textContent = "100";
     chunkSizeSelect.value = "1500";
     chunkOverlapSelect.value = "100";
-    document.getElementById("pdf-files").value = "";
+    clearAllSelectedFiles();
     setSystemStatus(true, t("systemReady"));
     buildStatus.textContent = t("statusVectorStoreCleared");
     setAskStatus(t("statusVectorStoreCleared"), false);
@@ -952,7 +1221,19 @@ document.addEventListener("keydown", (event) => {
     closeCitationModal();
   }
 });
+document.addEventListener("click", (event) => {
+  if (event.target.closest(".history-tech-trigger")) {
+    return;
+  }
+
+  document.querySelectorAll(".history-item.show-tech").forEach((node) => {
+    node.classList.remove("show-tech");
+  });
+});
 languageSelect.addEventListener("change", handleLanguageChange);
+filesInput.addEventListener("change", handleFileSelectionChange);
+selectedFilesList.addEventListener("click", handleSelectedFilesListClick);
+clearSelectedFilesButton.addEventListener("click", clearAllSelectedFiles);
 
 suggestionButtons.forEach((button) => {
   button.addEventListener("click", fillSuggestedQuestion);
@@ -987,5 +1268,6 @@ toggleSelfRagOptions(); // Initialize visibility
 buildForm.addEventListener("submit", buildIndex);
 askForm.addEventListener("submit", askQuestion);
 setAskStatus("", false);
+updateSelectedFilesSummary();
 syncHealth();
 loadHistory();

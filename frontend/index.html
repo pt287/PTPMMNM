@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/assets/styles.css?v=20260416a">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260418l">
 </head>
 <body>
   <div class="ambient-bg" aria-hidden="true"></div>
@@ -16,8 +16,16 @@
       <div class="sidebar-top">
         <p class="brand">SmartDoc AI</p>
         <div class="history-head-actions">
-          <button id="history-toggle" type="button" class="btn-ghost small" data-i18n="collapseHistory">Thu gọn</button>
-          <button id="refresh-history" type="button" class="btn-ghost small" data-i18n="refreshHistory">Làm mới</button>
+          <button id="history-toggle" type="button" class="btn-ghost small icon-btn" data-i18n-title="collapseHistory" data-i18n-aria="collapseHistory" title="Thu gọn" aria-label="Thu gọn">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M4 6h16v2H4zM4 11h10v2H4zM4 16h7v2H4z" fill="currentColor"/>
+            </svg>
+          </button>
+          <button id="refresh-history" type="button" class="btn-ghost small icon-btn" data-i18n-title="refreshHistory" data-i18n-aria="refreshHistory" title="Làm mới" aria-label="Làm mới">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M17.65 6.35A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.76-4.24L13 11h7V4z" fill="currentColor"/>
+            </svg>
+          </button>
         </div>
       </div>
       <section class="history-panel">
@@ -33,7 +41,11 @@
           <p class="chat-subtitle" data-i18n="sectionChatDesc">Đặt câu hỏi ngắn gọn, bối cảnh rõ ràng để nhận câu trả lời chính xác hơn.</p>
         </div>
         <div class="topbar-controls">
-          <button id="open-guide" type="button" class="btn-ghost" data-i18n="guideButton">Hướng dẫn</button>
+          <button id="open-guide" type="button" class="btn-ghost icon-btn" data-i18n-title="guideButton" data-i18n-aria="guideButton" title="Hướng dẫn" aria-label="Hướng dẫn">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 15h-2v-2h2zm1.07-7.75-.9.92A3.49 3.49 0 0 0 12 13h-1v-1a2.5 2.5 0 0 1 .73-1.77l1.24-1.26a1.5 1.5 0 1 0-2.56-1.06H8.4a3.5 3.5 0 1 1 5.67 2.84z" fill="currentColor"/>
+            </svg>
+          </button>
           <label class="lang-switch" for="ui-language">
             <span data-i18n="languageLabel">Ngôn ngữ</span>
             <select id="ui-language" aria-label="Language selector">
@@ -48,154 +60,202 @@
         </div>
       </header>
 
-      <section class="control-strip">
-        <form id="build-form" class="build-form compact">
-          <label>
-            <span data-i18n="pdfLabel">Chọn file PDF/DOCX</span>
-            <input id="pdf-files" type="file" accept="application/pdf,.pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" multiple required>
-          </label>
-          <label>
-            <span data-i18n="modelLabel">Model Ollama</span>
-            <select id="ollama-model" required>
-              <option value="qwen2.5:0.5b">qwen2.5:0.5b (RAM thấp)</option>
-              <option value="qwen2.5:1.5b">qwen2.5:1.5b</option>
-              <option value="qwen2.5:3b">qwen2.5:3b</option>
-              <option value="qwen2.5:7b">qwen2.5:7b (chất lượng cao)</option>
-            </select>
-          </label>
-          <label>
-            <span data-i18n="chunkSizeLabel">Chunk size</span>
-            <select id="chunk-size" required>
-              <option value="500">500</option>
-              <option value="1000">1000</option>
-              <option value="1500" selected>1500</option>
-              <option value="2000">2000</option>
-            </select>
-          </label>
-          <label>
-            <span data-i18n="chunkOverlapLabel">Chunk overlap</span>
-            <select id="chunk-overlap" required>
-              <option value="50">50</option>
-              <option value="100" selected>100</option>
-              <option value="200">200</option>
-            </select>
-          </label>
-          <label class="checkbox-label">
-            <input id="use-reranking" type="checkbox">
-            <span data-i18n="useRerankingLabel">Bật Re-ranking (Cross-Encoder)</span>
-          </label>
-          <label id="reranker-model-label" class="reranker-option">
-            <span data-i18n="rerankerModelLabel">Re-ranker Model</span>
-            <select id="reranker-model">
-              <option value="cross-encoder/ms-marco-MiniLM-L-6-v2">ms-marco-MiniLM-L-6-v2 (Tiếng Anh, nhanh)</option>
-              <option value="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1" selected>mmarco-mMiniLMv2-L12 (Đa ngôn ngữ)</option>
-              <option value="cross-encoder/ms-marco-MiniLM-L-12-v2">ms-marco-MiniLM-L-12-v2 (Chất lượng cao)</option>
-            </select>
-          </label>
-          <label id="rerank-top-n-label" class="reranker-option">
-            <span data-i18n="rerankTopNLabel">Re-rank Top N candidates</span>
-            <select id="rerank-top-n">
-              <option value="5">5 (nhanh)</option>
-              <option value="10" selected>10 (cân bằng)</option>
-              <option value="15">15</option>
-              <option value="20">20 (toàn diện)</option>
-            </select>
-          </label>
-          <label class="checkbox-label">
-            <input id="use-self-rag" type="checkbox">
-            <span data-i18n="useSelfRagLabel">Bật Self-RAG (Tự đánh giá)</span>
-          </label>
-          <label id="query-rewriting-label" class="self-rag-option">
-            <input id="enable-query-rewriting" type="checkbox" checked>
-            <span data-i18n="enableQueryRewritingLabel">Query Rewriting (Cải thiện câu hỏi)</span>
-          </label>
-          <label id="multi-hop-label" class="self-rag-option">
-            <input id="enable-multi-hop" type="checkbox">
-            <span data-i18n="enableMultiHopLabel">Multi-hop Reasoning (Suy luận nhiều bước)</span>
-          </label>
-          <label id="max-hops-label" class="self-rag-option">
-            <span data-i18n="maxHopsLabel">Max Hops</span>
-            <select id="max-hops">
-              <option value="2">2 (nhanh)</option>
-              <option value="3" selected>3 (cân bằng)</option>
-              <option value="4">4</option>
-              <option value="5">5 (toàn diện)</option>
-            </select>
-          </label>
-          <label id="confidence-threshold-label" class="self-rag-option">
-            <span data-i18n="confidenceThresholdLabel">Confidence Threshold</span>
-            <select id="confidence-threshold">
-              <option value="0.5">0.5 (dễ dãi)</option>
-              <option value="0.6">0.6</option>
-              <option value="0.7" selected>0.7 (cân bằng)</option>
-              <option value="0.8">0.8 (nghiêm ngặt)</option>
-              <option value="0.9">0.9 (rất nghiêm)</option>
-            </select>
-          </label>
-          <button type="submit" class="btn-primary" data-i18n="buildButton">Tạo RAG Index</button>
-        </form>
-      </section>
+      <div class="workspace-layout">
+        <section class="center-column">
+          <section class="upload-card">
+            <label>
+              <span data-i18n="pdfLabel">Chọn file PDF/DOCX</span>
+              <input id="pdf-files" form="build-form" type="file" accept="application/pdf,.pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" multiple required>
+              <p id="selected-files-summary" class="upload-files-summary">Đã chọn 0 tệp</p>
+            </label>
+            <div id="selected-files-panel" class="selected-files-panel" aria-live="polite">
+              <div class="selected-files-head">
+                <p id="selected-files-title" class="selected-files-title">Danh sách file đã chọn</p>
+                <button id="clear-selected-files" type="button" class="btn-ghost small">Xóa tất cả</button>
+              </div>
+              <div id="selected-files-list" class="selected-files-list"></div>
+            </div>
+            <button type="submit" form="build-form" class="btn-primary build-action">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M5 20h14v-2H5zm7-18L5.33 8h3.84v6h5.66V8h3.84z" fill="currentColor"/>
+              </svg>
+              <span data-i18n="buildButton">Tạo RAG Index</span>
+            </button>
+          </section>
 
-      <div id="build-progress" class="progress-wrap" aria-hidden="true">
-        <div id="build-progress-bar" class="progress-bar"></div>
-      </div>
-      <p id="build-status" class="status"></p>
-      <div class="metrics-inline">
-        <p><span data-i18n="metricLanguage">Ngôn ngữ</span>: <strong id="metric-language">unknown</strong></p>
-        <p><span data-i18n="metricChunks">Số chunk</span>: <strong id="metric-chunks">0</strong></p>
-        <p><span data-i18n="metricChunkSize">Chunk size</span>: <strong id="metric-chunk-size">1500</strong></p>
-        <p><span data-i18n="metricChunkOverlap">Chunk overlap</span>: <strong id="metric-chunk-overlap">100</strong></p>
-        <p><span data-i18n="metricReranking">Re-ranking</span>: <strong id="metric-reranking">Tắt</strong></p>
-        <p><span data-i18n="metricSelfRag">Self-RAG</span>: <strong id="metric-self-rag">Tắt</strong></p>
-      </div>
+          <div id="build-progress" class="progress-wrap" aria-hidden="true">
+            <div id="build-progress-bar" class="progress-bar"></div>
+          </div>
+          <p id="build-status" class="status"></p>
+          <div class="metrics-inline">
+            <p><span data-i18n="metricLanguage">Ngôn ngữ</span>: <strong id="metric-language">unknown</strong></p>
+            <p><span data-i18n="metricChunks">Số chunk</span>: <strong id="metric-chunks">0</strong></p>
+            <p><span data-i18n="metricChunkSize">Chunk size</span>: <strong id="metric-chunk-size">1500</strong></p>
+            <p><span data-i18n="metricChunkOverlap">Chunk overlap</span>: <strong id="metric-chunk-overlap">100</strong></p>
+            <p><span data-i18n="metricReranking">Re-ranking</span>: <strong id="metric-reranking">Tắt</strong></p>
+            <p><span data-i18n="metricSelfRag">Self-RAG</span>: <strong id="metric-self-rag">Tắt</strong></p>
+          </div>
 
-      <section class="chat-shell">
-        <div class="chat-actions">
-          <h2 data-i18n="sectionChatTitle">2. Hỏi đáp thông minh</h2>
-          <div class="chat-action-buttons">
-            <button id="clear-chat" type="button" class="btn-ghost" data-i18n="clearChat">Xóa chat</button>
-            <button id="clear-history" type="button" class="btn-ghost" data-i18n="clearHistory">Clear History</button>
-            <button id="clear-vector-store" type="button" class="btn-ghost" data-i18n="clearVectorStore">Clear Vector Store</button>
-          </div>
-        </div>
-        <div id="chat" class="chat" aria-live="polite"></div>
-        <div class="composer-area">
-          <div class="quick-questions">
-            <button
-              type="button"
-              class="suggestion"
-              data-question-vi="Tóm tắt 5 ý chính trong tài liệu"
-              data-question-en="Summarize the top 5 key points in this document"
-              data-i18n="suggestionSummary"
-            >Tóm tắt 5 ý chính</button>
-            <button
-              type="button"
-              class="suggestion"
-              data-question-vi="Liệt kê các mốc hành động quan trọng"
-              data-question-en="List important action items and deadlines"
-              data-i18n="suggestionAction"
-            >Liệt kê mốc hành động</button>
-            <button
-              type="button"
-              class="suggestion"
-              data-question-vi="So sánh 2 nội dung quan trọng trong tài liệu"
-              data-question-en="Compare two important sections in this document"
-              data-i18n="suggestionCompare"
-            >So sánh 2 nội dung</button>
-          </div>
-          <form id="ask-form" class="ask-form">
-            <input
-              id="question"
-              type="text"
-              placeholder="Ví dụ: Rút gọn tài liệu thành checklist 1 trang"
-              data-i18n-placeholder="questionPlaceholder"
-              required
-            >
-            <button type="submit" class="btn-primary" data-i18n="askButton">Gửi câu hỏi</button>
-          </form>
-          <p id="ask-status" class="status"><span id="ask-spinner" class="inline-spinner" aria-hidden="true"></span><span id="ask-status-text"></span></p>
-        </div>
-      </section>
+          <section class="chat-shell">
+            <div class="chat-actions">
+              <h2 data-i18n="sectionChatTitle">2. Hỏi đáp thông minh</h2>
+              <div class="chat-action-buttons">
+                <button id="clear-chat" type="button" class="btn-ghost icon-btn" data-i18n-title="clearChat" data-i18n-aria="clearChat" title="Xóa màn hình chat" aria-label="Xóa màn hình chat">
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M21 6h-5.19l-1-1h-5.62l-1 1H3v2h18zm-2 3H5v11a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2zM9 11h6v2H9zm0 4h4v2H9z" fill="currentColor"/>
+                  </svg>
+                </button>
+                <button id="clear-history" type="button" class="btn-ghost icon-btn" data-i18n-title="clearHistory" data-i18n-aria="clearHistory" title="Clear History" aria-label="Clear History">
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M13 3a9 9 0 1 0 8.95 10h-2.02A7 7 0 1 1 13 5v4l5-5-5-5z" fill="currentColor"/>
+                    <path d="M8 12h8v2H8z" fill="currentColor"/>
+                  </svg>
+                </button>
+                <button id="clear-vector-store" type="button" class="btn-ghost icon-btn" data-i18n-title="clearVectorStore" data-i18n-aria="clearVectorStore" title="Clear Vector Store" aria-label="Clear Vector Store">
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M12 3c-4.42 0-8 1.34-8 3v12c0 1.66 3.58 3 8 3s8-1.34 8-3V6c0-1.66-3.58-3-8-3zm0 2c3.63 0 6 .93 6 1s-2.37 1-6 1-6-.93-6-1 2.37-1 6-1zm0 14c-3.63 0-6-.93-6-1v-2.11c1.47.7 3.65 1.11 6 1.11s4.53-.41 6-1.11V18c0 .07-2.37 1-6 1zm0-5c-3.63 0-6-.93-6-1v-2.11C7.47 11.59 9.65 12 12 12s4.53-.41 6-1.11V13c0 .07-2.37 1-6 1z" fill="currentColor"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <div id="chat" class="chat" aria-live="polite"></div>
+            <div class="composer-area">
+              <div class="quick-questions">
+                <button
+                  type="button"
+                  class="suggestion"
+                  data-question-vi="Tóm tắt 5 ý chính trong tài liệu"
+                  data-question-en="Summarize the top 5 key points in this document"
+                  data-i18n="suggestionSummary"
+                >Tóm tắt 5 ý chính</button>
+                <button
+                  type="button"
+                  class="suggestion"
+                  data-question-vi="Liệt kê các mốc hành động quan trọng"
+                  data-question-en="List important action items and deadlines"
+                  data-i18n="suggestionAction"
+                >Liệt kê mốc hành động</button>
+                <button
+                  type="button"
+                  class="suggestion"
+                  data-question-vi="So sánh 2 nội dung quan trọng trong tài liệu"
+                  data-question-en="Compare two important sections in this document"
+                  data-i18n="suggestionCompare"
+                >So sánh 2 nội dung</button>
+              </div>
+              <form id="ask-form" class="ask-form">
+                <input
+                  id="question"
+                  type="text"
+                  placeholder="Ví dụ: Rút gọn tài liệu thành checklist 1 trang"
+                  data-i18n-placeholder="questionPlaceholder"
+                  required
+                >
+                <button type="submit" class="btn-primary send-action" data-i18n-title="askButton" data-i18n-aria="askButton" title="Gửi câu hỏi" aria-label="Gửi câu hỏi">
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M2 21l20-9L2 3l1 7 12 2-12 2z" fill="currentColor"/>
+                  </svg>
+                  <span data-i18n="askButton">Gửi câu hỏi</span>
+                </button>
+              </form>
+              <p id="ask-status" class="status"><span id="ask-spinner" class="inline-spinner" aria-hidden="true"></span><span id="ask-status-text"></span></p>
+            </div>
+          </section>
+        </section>
+
+        <aside class="right-sidebar">
+          <section class="config-panel">
+            <h2 data-i18n="sectionConfigTitle">1. Tài liệu</h2>
+            <p data-i18n="sectionConfigDesc">Dành cho bài tập, báo cáo, quy trình nghiệp vụ, tài liệu họp.</p>
+            <form id="build-form" class="build-form compact">
+              <label>
+                <span data-i18n="modelLabel">Model Ollama</span>
+                <select id="ollama-model" required>
+                  <option value="qwen2.5:0.5b">qwen2.5:0.5b (RAM thấp)</option>
+                  <option value="qwen2.5:1.5b">qwen2.5:1.5b</option>
+                  <option value="qwen2.5:3b">qwen2.5:3b</option>
+                  <option value="qwen2.5:7b">qwen2.5:7b (chất lượng cao)</option>
+                </select>
+              </label>
+              <label>
+                <span data-i18n="chunkSizeLabel">Chunk size</span>
+                <select id="chunk-size" required>
+                  <option value="500">500</option>
+                  <option value="1000">1000</option>
+                  <option value="1500" selected>1500</option>
+                  <option value="2000">2000</option>
+                </select>
+              </label>
+              <label>
+                <span data-i18n="chunkOverlapLabel">Chunk overlap</span>
+                <select id="chunk-overlap" required>
+                  <option value="50">50</option>
+                  <option value="100" selected>100</option>
+                  <option value="200">200</option>
+                </select>
+              </label>
+              <label class="checkbox-label switch-label">
+                <span data-i18n="useRerankingLabel">Bật Re-ranking (Cross-Encoder)</span>
+                <span class="switch-control">
+                  <input id="use-reranking" type="checkbox">
+                  <span class="switch-slider" aria-hidden="true"></span>
+                </span>
+              </label>
+              <label id="reranker-model-label" class="reranker-option">
+                <span data-i18n="rerankerModelLabel">Re-ranker Model</span>
+                <select id="reranker-model">
+                  <option value="cross-encoder/ms-marco-MiniLM-L-6-v2">ms-marco-MiniLM-L-6-v2 (Tiếng Anh, nhanh)</option>
+                  <option value="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1" selected>mmarco-mMiniLMv2-L12 (Đa ngôn ngữ)</option>
+                  <option value="cross-encoder/ms-marco-MiniLM-L-12-v2">ms-marco-MiniLM-L-12-v2 (Chất lượng cao)</option>
+                </select>
+              </label>
+              <label id="rerank-top-n-label" class="reranker-option">
+                <span data-i18n="rerankTopNLabel">Re-rank Top N candidates</span>
+                <select id="rerank-top-n">
+                  <option value="5">5 (nhanh)</option>
+                  <option value="10" selected>10 (cân bằng)</option>
+                  <option value="15">15</option>
+                  <option value="20">20 (toàn diện)</option>
+                </select>
+              </label>
+              <label class="checkbox-label switch-label">
+                <span data-i18n="useSelfRagLabel">Bật Self-RAG (Tự đánh giá)</span>
+                <span class="switch-control">
+                  <input id="use-self-rag" type="checkbox">
+                  <span class="switch-slider" aria-hidden="true"></span>
+                </span>
+              </label>
+              <label id="query-rewriting-label" class="self-rag-option">
+                <input id="enable-query-rewriting" type="checkbox" checked>
+                <span data-i18n="enableQueryRewritingLabel">Query Rewriting (Cải thiện câu hỏi)</span>
+              </label>
+              <label id="multi-hop-label" class="self-rag-option">
+                <input id="enable-multi-hop" type="checkbox">
+                <span data-i18n="enableMultiHopLabel">Multi-hop Reasoning (Suy luận nhiều bước)</span>
+              </label>
+              <label id="max-hops-label" class="self-rag-option">
+                <span data-i18n="maxHopsLabel">Max Hops</span>
+                <select id="max-hops">
+                  <option value="2">2 (nhanh)</option>
+                  <option value="3" selected>3 (cân bằng)</option>
+                  <option value="4">4</option>
+                  <option value="5">5 (toàn diện)</option>
+                </select>
+              </label>
+              <label id="confidence-threshold-label" class="self-rag-option">
+                <span data-i18n="confidenceThresholdLabel">Confidence Threshold</span>
+                <select id="confidence-threshold">
+                  <option value="0.5">0.5 (dễ dãi)</option>
+                  <option value="0.6">0.6</option>
+                  <option value="0.7" selected>0.7 (cân bằng)</option>
+                  <option value="0.8">0.8 (nghiêm ngặt)</option>
+                  <option value="0.9">0.9 (rất nghiêm)</option>
+                </select>
+              </label>
+            </form>
+          </section>
+        </aside>
+      </div>
     </section>
 
     <div id="guide-popup" class="guide-popup" aria-hidden="true">
@@ -233,6 +293,6 @@
     </div>
   </main>
 
-  <script src="/assets/app.js?v=20260416a"></script>
+  <script src="/assets/app.js?v=20260418l"></script>
 </body>
 </html>
