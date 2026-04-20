@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/assets/styles.css?v=20260418l">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260420f">
 </head>
 <body>
   <div class="ambient-bg" aria-hidden="true"></div>
@@ -87,15 +87,6 @@
             <div id="build-progress-bar" class="progress-bar"></div>
           </div>
           <p id="build-status" class="status"></p>
-          <div class="metrics-inline">
-            <p><span data-i18n="metricLanguage">Ngôn ngữ</span>: <strong id="metric-language">unknown</strong></p>
-            <p><span data-i18n="metricChunks">Số chunk</span>: <strong id="metric-chunks">0</strong></p>
-            <p><span data-i18n="metricChunkSize">Chunk size</span>: <strong id="metric-chunk-size">1500</strong></p>
-            <p><span data-i18n="metricChunkOverlap">Chunk overlap</span>: <strong id="metric-chunk-overlap">100</strong></p>
-            <p><span data-i18n="metricReranking">Re-ranking</span>: <strong id="metric-reranking">Tắt</strong></p>
-            <p><span data-i18n="metricSelfRag">Self-RAG</span>: <strong id="metric-self-rag">Tắt</strong></p>
-          </div>
-
           <section class="chat-shell">
             <div class="chat-actions">
               <h2 data-i18n="sectionChatTitle">2. Hỏi đáp thông minh</h2>
@@ -195,6 +186,13 @@
                 </select>
               </label>
               <label class="checkbox-label switch-label">
+                <span data-i18n="useGraphRagLabel">Bật GraphRAG (mở rộng ngữ cảnh liên quan)</span>
+                <span class="switch-control">
+                  <input id="use-graph-rag" type="checkbox">
+                  <span class="switch-slider" aria-hidden="true"></span>
+                </span>
+              </label>
+              <label class="checkbox-label switch-label">
                 <span data-i18n="useRerankingLabel">Bật Re-ranking (Cross-Encoder)</span>
                 <span class="switch-control">
                   <input id="use-reranking" type="checkbox">
@@ -253,6 +251,10 @@
                 </select>
               </label>
             </form>
+            <div class="index-brief" aria-live="polite">
+              <p><span data-i18n="metricLanguage">Ngôn ngữ</span>: <strong id="metric-language">unknown</strong></p>
+              <p><span data-i18n="metricChunks">Số chunk</span>: <strong id="metric-chunks">0</strong></p>
+            </div>
           </section>
         </aside>
       </div>
@@ -293,6 +295,6 @@
     </div>
   </main>
 
-  <script src="/assets/app.js?v=20260418l"></script>
+  <script src="/assets/app.js?v=20260420c"></script>
 </body>
 </html>

@@ -95,7 +95,66 @@ Sau do mo trinh duyet: http://127.0.0.1:8000
 - Overlap: 100
 - Retrieval: top k = 3
 - Vector DB: FAISS
+- **Hybrid Search**: FAISS + BM25 (EnsembleRetriever, weight 0.7/0.3)
+- **GraphRAG**: mo rong context bang do thi lien ket chunk
 - **Re-ranking**: Cross-Encoder (tuy chon, tang do chinh xac retrieval)
+- **Self-RAG**: query rewriting + multi-hop + tu danh gia do tin cay
+- **Metadata Filtering**: loc theo `source` va `doc_id`
+
+## Cong Nghe Moi Da Them
+
+### 1) GraphRAG Retrieval Expansion
+
+- Build do thi lien ket giua cac chunk dua tren token overlap.
+- Sau khi retrieval ban dau, he thong mo rong them cac chunk lien quan theo so hop cau hinh.
+- Co the bat/tat tren UI bang switch GraphRAG.
+
+Gia tri:
+
+- Tang recall khi thong tin nam rai rac o nhieu phan trong tai lieu.
+- Huu ich cho cau hoi tong hop, cau hoi can nhieu context lien thong.
+
+### 2) Hybrid Search (Semantic + Keyword)
+
+- Ket hop semantic retrieval (FAISS) va keyword retrieval (BM25).
+- Su dung EnsembleRetriever voi trong so mac dinh:
+	- Semantic: 0.7
+	- Keyword: 0.3
+
+Gia tri:
+
+- Giam bo sot keyword quan trong.
+- Can bang giua matching ngu nghia va matching tu khoa.
+
+### 3) Self-RAG Pipeline
+
+- Query Rewriting: viet lai cau hoi de retrieval ro y hon.
+- Multi-hop Retrieval: truy hoi lap nhieu vong cho cau hoi phuc tap.
+- Answer Evaluation: tu cham diem grounding/relevance/completeness.
+
+Gia tri:
+
+- Tang do on dinh chat luong tra loi.
+- Co confidence metadata de canh bao khi do tin cay thap.
+
+### 4) Multi-document + Metadata
+
+- Ho tro upload nhieu file PDF/DOCX trong cung session.
+- Moi chunk duoc gan metadata:
+	- `source`
+	- `doc_id`
+	- `upload_time`
+	- `file_type`
+- API hoi dap ho tro `filter_metadata` de loc theo tai lieu cu the.
+
+### 5) Session-aware Config Restore
+
+- Moi lan build index, cau hinh retrieval duoc luu theo session.
+- Khi mo lai session cu, cac switch va tham so duoc khoi phuc:
+	- GraphRAG
+	- Re-ranking + model + Top-N
+	- Self-RAG + query rewriting + multi-hop + threshold
+- Giup tiep tuc lam viec tren session cu ma khong phai cau hinh lai tu dau.
 
 ## Cross-Encoder Re-ranking (Moi!)
 

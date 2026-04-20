@@ -38,16 +38,13 @@ const chunkSizeSelect = document.getElementById("chunk-size");
 const chunkOverlapSelect = document.getElementById("chunk-overlap");
 const metricLanguage = document.getElementById("metric-language");
 const metricChunks = document.getElementById("metric-chunks");
-const metricChunkSize = document.getElementById("metric-chunk-size");
-const metricChunkOverlap = document.getElementById("metric-chunk-overlap");
-const metricReranking = document.getElementById("metric-reranking");
+const useGraphRagCheckbox = document.getElementById("use-graph-rag");
 const useRerankingCheckbox = document.getElementById("use-reranking");
 const rerankerModelSelect = document.getElementById("reranker-model");
 const rerankTopNSelect = document.getElementById("rerank-top-n");
 const rerankerModelLabel = document.getElementById("reranker-model-label");
 const rerankTopNLabel = document.getElementById("rerank-top-n-label");
 
-const metricSelfRag = document.getElementById("metric-self-rag");
 const useSelfRagCheckbox = document.getElementById("use-self-rag");
 const enableQueryRewritingCheckbox = document.getElementById("enable-query-rewriting");
 const enableMultiHopCheckbox = document.getElementById("enable-multi-hop");
@@ -75,6 +72,8 @@ const translations = {
     metricChunks: "Số chunk",
     metricChunkSize: "Chunk size",
     metricChunkOverlap: "Chunk overlap",
+    metricGraphRag: "GraphRAG tăng ngữ cảnh",
+    useGraphRagLabel: "Bật GraphRAG (mở rộng ngữ cảnh liên quan)",
     metricReranking: "Re-ranking",
     useRerankingLabel: "Bật Re-ranking (Cross-Encoder)",
     rerankerModelLabel: "Re-ranker Model",
@@ -168,6 +167,8 @@ const translations = {
     metricChunks: "Chunks",
     metricChunkSize: "Chunk size",
     metricChunkOverlap: "Chunk overlap",
+    metricGraphRag: "GraphRAG context boost",
+    useGraphRagLabel: "Enable GraphRAG (expand related context)",
     metricReranking: "Re-ranking",
     useRerankingLabel: "Enable Re-ranking (Cross-Encoder)",
     rerankerModelLabel: "Re-ranker Model",
@@ -721,6 +722,35 @@ function renderSessionQa(container, qaItems) {
   });
 }
 
+function applySessionConfigToControls(data) {
+  useGraphRagCheckbox.checked = Boolean(data.use_graph_rag);
+  useRerankingCheckbox.checked = Boolean(data.use_reranking);
+  useSelfRagCheckbox.checked = Boolean(data.use_self_rag);
+
+  if (data.reranker_model) {
+    rerankerModelSelect.value = String(data.reranker_model);
+  }
+  if (data.rerank_top_n != null) {
+    rerankTopNSelect.value = String(data.rerank_top_n);
+  }
+
+  if (data.enable_query_rewriting != null) {
+    enableQueryRewritingCheckbox.checked = Boolean(data.enable_query_rewriting);
+  }
+  if (data.enable_multi_hop != null) {
+    enableMultiHopCheckbox.checked = Boolean(data.enable_multi_hop);
+  }
+  if (data.max_hops != null) {
+    maxHopsSelect.value = String(data.max_hops);
+  }
+  if (data.confidence_threshold != null) {
+    confidenceThresholdSelect.value = String(data.confidence_threshold);
+  }
+
+  toggleRerankingOptions();
+  toggleSelfRagOptions();
+}
+
 async function activateSession(sessionId) {
   setAskStatus(t("activatingSession"), true);
 
@@ -736,8 +766,7 @@ async function activateSession(sessionId) {
   hasIndexedData = true;
   metricLanguage.textContent = data.doc_language;
   metricChunks.textContent = String(data.chunk_count);
-  metricChunkSize.textContent = String(data.chunk_size || 1500);
-  metricChunkOverlap.textContent = String(data.chunk_overlap || 100);
+  applySessionConfigToControls(data);
   chunkSizeSelect.value = String(data.chunk_size || 1500);
   chunkOverlapSelect.value = String(data.chunk_overlap || 100);
   setSystemStatus(true, `${t("systemIndexed")} - ${t("sessionIdLabel")} #${sessionId}`);
@@ -874,6 +903,7 @@ function renderUploadHistory(items) {
       <p class="history-tech-line"><strong>${currentLanguage === "vi" ? "File" : "Files"}:</strong> ${files.length}</p>
       <p class="history-tech-line"><strong>Chunk:</strong> ${entry.chunk_count} | cs ${entry.chunk_size} | ov ${entry.chunk_overlap}</p>
       <p class="history-tech-line"><strong>Model:</strong> ${entry.ollama_model}</p>
+      <p class="history-tech-line"><strong>${t("metricGraphRag")}:</strong> ${entry.use_graph_rag ? (currentLanguage === "vi" ? "Bật" : "On") : (currentLanguage === "vi" ? "Tắt" : "Off")}</p>
       <p class="history-tech-line"><strong>${t("metricReranking")}:</strong> ${entry.use_reranking ? (currentLanguage === "vi" ? "Bật" : "On") : (currentLanguage === "vi" ? "Tắt" : "Off")}</p>
       <p class="history-tech-line"><strong>${t("metricSelfRag")}:</strong> ${entry.use_self_rag ? (currentLanguage === "vi" ? "Bật" : "On") : (currentLanguage === "vi" ? "Tắt" : "Off")}</p>
     `;
@@ -950,11 +980,7 @@ async function syncHealth() {
     const data = await response.json();
     metricLanguage.textContent = data.doc_language;
     metricChunks.textContent = String(data.chunk_count);
-    metricChunkSize.textContent = String(data.chunk_size || 1500);
-    metricChunkOverlap.textContent = String(data.chunk_overlap || 100);
-    metricReranking.textContent = data.use_reranking
-      ? (currentLanguage === "vi" ? "Bật" : "On")
-      : (currentLanguage === "vi" ? "Tắt" : "Off");
+    applySessionConfigToControls(data);
     chunkSizeSelect.value = String(data.chunk_size || 1500);
     chunkOverlapSelect.value = String(data.chunk_overlap || 100);
     hasIndexedData = Boolean(data.indexed);
@@ -997,6 +1023,7 @@ async function buildIndex(event) {
   formData.append("ollama_model", modelSelect.value);
   formData.append("chunk_size", chunkSizeSelect.value);
   formData.append("chunk_overlap", chunkOverlapSelect.value);
+  formData.append("use_graph_rag", useGraphRagCheckbox.checked);
   formData.append("use_reranking", useRerankingCheckbox.checked);
   formData.append("reranker_model", rerankerModelSelect.value);
   formData.append("rerank_top_n", rerankTopNSelect.value);
@@ -1019,14 +1046,6 @@ async function buildIndex(event) {
 
     metricLanguage.textContent = data.doc_language;
     metricChunks.textContent = String(data.chunk_count);
-    metricChunkSize.textContent = String(data.chunk_size);
-    metricChunkOverlap.textContent = String(data.chunk_overlap);
-    metricReranking.textContent = data.use_reranking
-      ? (currentLanguage === "vi" ? "Bật" : "On")
-      : (currentLanguage === "vi" ? "Tắt" : "Off");
-    metricSelfRag.textContent = data.use_self_rag
-      ? (currentLanguage === "vi" ? "Bật" : "On")
-      : (currentLanguage === "vi" ? "Tắt" : "Off");
     chunkSizeSelect.value = String(data.chunk_size);
     chunkOverlapSelect.value = String(data.chunk_overlap);
     buildStatus.textContent = t("statusBuildSuccess");
@@ -1161,8 +1180,6 @@ async function clearVectorStore() {
     chat.innerHTML = "";
     metricLanguage.textContent = "unknown";
     metricChunks.textContent = "0";
-    metricChunkSize.textContent = "1500";
-    metricChunkOverlap.textContent = "100";
     chunkSizeSelect.value = "1500";
     chunkOverlapSelect.value = "100";
     clearAllSelectedFiles();

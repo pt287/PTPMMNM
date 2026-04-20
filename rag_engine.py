@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -46,6 +48,9 @@ class RAGConfig:
     use_hybrid_search: bool = False
     hybrid_semantic_weight: float = 0.7
     hybrid_keyword_weight: float = 0.3
+    use_graph_rag: bool = False
+    graph_expansion_hops: int = 1
+    graph_max_related_chunks: int = 6
 
     # Self-RAG configuration
     use_self_rag: bool = False
@@ -64,6 +69,10 @@ def _validate_config(config: RAGConfig) -> None:
         raise ValueError("chunk_overlap phải nhỏ hơn chunk_size.")
     if config.top_k <= 0:
         raise ValueError("top_k phải lớn hơn 0.")
+    if config.graph_expansion_hops < 0:
+        raise ValueError("graph_expansion_hops không được âm.")
+    if config.graph_max_related_chunks < 0:
+        raise ValueError("graph_max_related_chunks không được âm.")
 
 
 def _default_upload_timestamp() -> str:
@@ -323,6 +332,77 @@ def split_documents(documents, config: RAGConfig):
     return chunks
 
 
+_GRAPH_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "into", "is", "it",
+    "of", "on", "or", "that", "the", "this", "to", "was", "were", "with", "which", "what", "when",
+    "where", "who", "why", "how", "do", "does", "did", "can", "could", "would", "should", "will",
+    "you", "your", "we", "our", "they", "their", "them",
+    "la", "là", "va", "và", "cua", "của", "cho", "trong", "ngoai", "ngoài", "nay", "này", "kia",
+    "mot", "một", "nhung", "những", "cac", "các", "toi", "tôi", "ban", "bạn", "duoc", "được", "khong",
+    "không", "co", "có", "se", "sẽ", "da", "đã", "ve", "về", "tai", "tại", "tu", "từ", "den", "đến",
+}
+
+
+def _graph_tokenize(text: str, max_terms: int = 24) -> set[str]:
+    tokens = re.findall(r"[\w\-]{3,}", (text or "").lower(), flags=re.UNICODE)
+    filtered = [tok for tok in tokens if tok not in _GRAPH_STOPWORDS and not tok.isdigit()]
+    if not filtered:
+        return set()
+
+    counts: Dict[str, int] = {}
+    for token in filtered:
+        counts[token] = counts.get(token, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return {token for token, _ in ranked[:max_terms]}
+
+
+def _chunk_identifier(doc: Document, fallback_idx: int) -> int:
+    metadata = doc.metadata or {}
+    chunk_id = metadata.get("chunk_id")
+    if isinstance(chunk_id, int):
+        return chunk_id
+    if isinstance(chunk_id, str) and chunk_id.isdigit():
+        return int(chunk_id)
+    return fallback_idx
+
+
+def _build_chunk_graph(documents: Sequence[Document], min_overlap: int = 2) -> Dict[int, set[int]]:
+    token_index: Dict[str, List[int]] = defaultdict(list)
+    overlap_counts: Dict[int, Dict[int, int]] = defaultdict(dict)
+    graph: Dict[int, set[int]] = defaultdict(set)
+
+    doc_ids: List[int] = []
+    for idx, doc in enumerate(documents, start=1):
+        chunk_id = _chunk_identifier(doc, idx)
+        doc_ids.append(chunk_id)
+        tokens = _graph_tokenize(doc.page_content)
+        for token in tokens:
+            token_index[token].append(chunk_id)
+
+    for chunk_id in doc_ids:
+        graph.setdefault(chunk_id, set())
+
+    for related_chunks in token_index.values():
+        unique_chunks = sorted(set(related_chunks))
+        if len(unique_chunks) < 2:
+            continue
+
+        for i in range(len(unique_chunks)):
+            left = unique_chunks[i]
+            for j in range(i + 1, len(unique_chunks)):
+                right = unique_chunks[j]
+                overlap_counts[left][right] = overlap_counts[left].get(right, 0) + 1
+                overlap_counts[right][left] = overlap_counts[right].get(left, 0) + 1
+
+    for source_chunk, neighbors in overlap_counts.items():
+        for target_chunk, overlap in neighbors.items():
+            if overlap >= min_overlap:
+                graph[source_chunk].add(target_chunk)
+
+    return graph
+
+
 @lru_cache(maxsize=4)
 def _get_embeddings(model_name: str) -> HuggingFaceEmbeddings:
     # Cache embedding model instance to avoid cold-loading on every rebuild.
@@ -442,6 +522,116 @@ class HybridSearchRetriever(BaseRetriever):
         return rerank_documents(query, combined_docs[:candidate_k], self.config)
 
 
+class GraphRAGRetriever(BaseRetriever):
+    """Retriever that expands retrieval candidates via a lightweight chunk graph."""
+
+    vectorstore: FAISS
+    documents: List[Document]
+    config: RAGConfig
+    filter_metadata: Optional[Dict[str, Any]] = None
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: Optional[CallbackManagerForRetrieverRun] = None
+    ) -> List[Document]:
+        search_filter = _sanitize_filter_metadata(self.filter_metadata)
+        filtered_docs = filter_documents_by_metadata(self.documents, search_filter)
+        if not filtered_docs:
+            return []
+
+        candidate_k = max(self.config.top_k, self.config.rerank_top_n)
+        retrieval_config = RAGConfig(
+            **{
+                **self.config.__dict__,
+                "top_k": candidate_k,
+                "use_reranking": False,
+            }
+        )
+
+        if self.config.use_hybrid_search:
+            base_retriever: Any = HybridSearchRetriever(
+                vectorstore=self.vectorstore,
+                documents=self.documents,
+                config=retrieval_config,
+                filter_metadata=search_filter,
+            )
+        else:
+            base_retriever = VectorSearchRetriever(
+                vectorstore=self.vectorstore,
+                documents=self.documents,
+                config=retrieval_config,
+                filter_metadata=search_filter,
+            )
+
+        initial_docs = list(base_retriever.invoke(query) or [])
+        initial_docs = filter_documents_by_metadata(initial_docs, search_filter)
+        if not initial_docs:
+            return []
+
+        doc_by_chunk_id = {
+            _chunk_identifier(doc, idx): doc
+            for idx, doc in enumerate(filtered_docs, start=1)
+        }
+        chunk_graph = _build_chunk_graph(filtered_docs)
+
+        initial_chunk_ids = [
+            _chunk_identifier(doc, idx)
+            for idx, doc in enumerate(initial_docs, start=1)
+        ]
+        expanded_chunk_ids = set(initial_chunk_ids)
+        frontier = set(initial_chunk_ids)
+
+        for _ in range(self.config.graph_expansion_hops):
+            next_frontier: set[int] = set()
+            for chunk_id in frontier:
+                neighbors = chunk_graph.get(chunk_id, set())
+                next_frontier.update(neighbors)
+
+            next_frontier -= expanded_chunk_ids
+            if not next_frontier:
+                break
+
+            allowed = self.config.graph_max_related_chunks
+            if allowed > 0:
+                remaining = max(0, allowed - max(0, len(expanded_chunk_ids) - len(initial_chunk_ids)))
+                if remaining == 0:
+                    break
+                ordered_neighbors = sorted(next_frontier)
+                next_frontier = set(ordered_neighbors[:remaining])
+
+            expanded_chunk_ids.update(next_frontier)
+            frontier = next_frontier
+
+        query_tokens = _graph_tokenize(query, max_terms=32)
+        scored: List[Tuple[float, Document]] = []
+        initial_rank = {
+            chunk_id: rank
+            for rank, chunk_id in enumerate(initial_chunk_ids)
+        }
+
+        for chunk_id in expanded_chunk_ids:
+            doc = doc_by_chunk_id.get(chunk_id)
+            if doc is None:
+                continue
+
+            # Combine lexical overlap and initial retrieval rank for stable ordering.
+            overlap = len(query_tokens & _graph_tokenize(doc.page_content, max_terms=32))
+            rank_bonus = max(0, candidate_k - initial_rank.get(chunk_id, candidate_k + 3))
+            score = float(overlap * 2 + rank_bonus)
+            scored.append((score, doc))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        expanded_docs = [doc for _, doc in scored]
+
+        if not self.config.use_reranking:
+            return expanded_docs[: self.config.top_k]
+
+        rerank_candidates = expanded_docs[:candidate_k]
+        return rerank_documents(query, rerank_candidates, self.config)
+
+
 def rerank_documents(
     query: str,
     documents: List[Document],
@@ -529,7 +719,9 @@ def build_qa_chain(vectorstore: FAISS, chunks: List[Document], config: RAGConfig
     )
     prompt = _build_prompt()
 
-    if config.use_hybrid_search:
+    if config.use_graph_rag:
+        retriever = GraphRAGRetriever(vectorstore=vectorstore, documents=chunks, config=config)
+    elif config.use_hybrid_search:
         retriever = HybridSearchRetriever(vectorstore=vectorstore, documents=chunks, config=config)
     elif config.use_reranking:
         retriever = RerankingRetriever(vectorstore=vectorstore, documents=chunks, config=config)

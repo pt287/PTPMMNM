@@ -49,6 +49,7 @@ class AppState:
         self.reranker_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
         self.rerank_top_n = 10
         self.use_hybrid_search = False
+        self.use_graph_rag = False
 
         # Self-RAG state
         self.use_self_rag = False
@@ -85,7 +86,8 @@ def _init_db() -> None:
                     ollama_model TEXT NOT NULL,
                     embedding_model TEXT NOT NULL,
                     temperature REAL NOT NULL,
-                    use_hybrid_search INTEGER NOT NULL DEFAULT 0
+                    use_hybrid_search INTEGER NOT NULL DEFAULT 0,
+                    use_graph_rag INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -142,6 +144,8 @@ def _init_db() -> None:
                 conn.execute("ALTER TABLE index_sessions ADD COLUMN chunk_overlap INTEGER NOT NULL DEFAULT 100")
             if "use_hybrid_search" not in session_columns:
                 conn.execute("ALTER TABLE index_sessions ADD COLUMN use_hybrid_search INTEGER NOT NULL DEFAULT 0")
+            if "use_graph_rag" not in session_columns:
+                conn.execute("ALTER TABLE index_sessions ADD COLUMN use_graph_rag INTEGER NOT NULL DEFAULT 0")
             if "use_reranking" not in session_columns:
                 conn.execute("ALTER TABLE index_sessions ADD COLUMN use_reranking INTEGER NOT NULL DEFAULT 0")
             if "reranker_model" not in session_columns:
@@ -195,6 +199,7 @@ def _store_index_session(
     embedding_model: str,
     temperature: float,
     use_hybrid_search: bool,
+    use_graph_rag: bool,
     use_reranking: bool,
     reranker_model: str,
     rerank_top_n: int,
@@ -211,10 +216,10 @@ def _store_index_session(
                 """
                 INSERT INTO index_sessions (
                     doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature,
-                    use_hybrid_search,
+                    use_hybrid_search, use_graph_rag,
                     use_reranking, reranker_model, rerank_top_n,
                     use_self_rag, enable_query_rewriting, enable_multi_hop, max_hops, confidence_threshold
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     doc_language,
@@ -225,6 +230,7 @@ def _store_index_session(
                     embedding_model,
                     temperature,
                     1 if use_hybrid_search else 0,
+                    1 if use_graph_rag else 0,
                     1 if use_reranking else 0,
                     reranker_model if use_reranking else None,
                     rerank_top_n,
@@ -292,7 +298,7 @@ def _fetch_upload_history(limit: int) -> List[Dict[str, Any]]:
             sessions = conn.execute(
                 """
                 SELECT id, created_at, doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature,
-                       use_hybrid_search,
+                      use_hybrid_search, use_graph_rag,
                        use_reranking, reranker_model, rerank_top_n,
                        use_self_rag, enable_query_rewriting, enable_multi_hop, max_hops, confidence_threshold
                 FROM index_sessions
@@ -337,6 +343,7 @@ def _fetch_upload_history(limit: int) -> List[Dict[str, Any]]:
                         "embedding_model": row["embedding_model"],
                         "temperature": row["temperature"],
                         "use_hybrid_search": bool(row["use_hybrid_search"]),
+                        "use_graph_rag": bool(row["use_graph_rag"]),
                         "use_reranking": bool(row["use_reranking"]),
                         "reranker_model": row["reranker_model"],
                         "rerank_top_n": row["rerank_top_n"],
@@ -520,7 +527,7 @@ def _fetch_session_info(session_id: int) -> Optional[Dict[str, Any]]:
             row = conn.execute(
                 """
                 SELECT id, created_at, doc_language, chunk_count, chunk_size, chunk_overlap, ollama_model, embedding_model, temperature,
-                       use_hybrid_search,
+                      use_hybrid_search, use_graph_rag,
                        use_reranking, reranker_model, rerank_top_n,
                        use_self_rag, enable_query_rewriting, enable_multi_hop, max_hops, confidence_threshold
                 FROM index_sessions
@@ -543,6 +550,7 @@ def _fetch_session_info(session_id: int) -> Optional[Dict[str, Any]]:
         "embedding_model": row["embedding_model"],
         "temperature": row["temperature"],
         "use_hybrid_search": bool(row["use_hybrid_search"]),
+        "use_graph_rag": bool(row["use_graph_rag"]),
         "use_reranking": bool(row["use_reranking"]),
         "reranker_model": row["reranker_model"],
         "rerank_top_n": row["rerank_top_n"],
@@ -613,6 +621,7 @@ def health() -> dict:
         "chunk_size": state.chunk_size,
         "chunk_overlap": state.chunk_overlap,
         "use_hybrid_search": state.use_hybrid_search,
+        "use_graph_rag": state.use_graph_rag,
         "use_reranking": state.use_reranking,
         "reranker_model": state.reranker_model,
         "rerank_top_n": state.rerank_top_n,
@@ -651,6 +660,7 @@ def session_history(session_id: int, limit: int = 30) -> dict:
             "chunk_size": session["chunk_size"],
             "chunk_overlap": session["chunk_overlap"],
             "use_hybrid_search": session["use_hybrid_search"],
+            "use_graph_rag": session["use_graph_rag"],
             "use_reranking": session["use_reranking"],
             "reranker_model": session["reranker_model"],
             "rerank_top_n": session["rerank_top_n"],
@@ -721,6 +731,7 @@ def activate_session(session_id: int) -> dict:
         top_k=3,
         temperature=session["temperature"],
         use_hybrid_search=session["use_hybrid_search"],
+        use_graph_rag=session["use_graph_rag"],
         use_reranking=session["use_reranking"],
         reranker_model=session["reranker_model"] or "cross-encoder/ms-marco-MiniLM-L-6-v2",
         rerank_top_n=session["rerank_top_n"],
@@ -746,6 +757,7 @@ def activate_session(session_id: int) -> dict:
     state.chunk_size = session["chunk_size"]
     state.chunk_overlap = session["chunk_overlap"]
     state.use_hybrid_search = session["use_hybrid_search"]
+    state.use_graph_rag = session["use_graph_rag"]
     state.use_reranking = session["use_reranking"]
     state.reranker_model = session["reranker_model"] or "cross-encoder/ms-marco-MiniLM-L-6-v2"
     state.rerank_top_n = session["rerank_top_n"]
@@ -768,9 +780,15 @@ def activate_session(session_id: int) -> dict:
         "chunk_size": session["chunk_size"],
         "chunk_overlap": session["chunk_overlap"],
         "use_hybrid_search": session["use_hybrid_search"],
+        "use_graph_rag": session["use_graph_rag"],
         "use_reranking": session["use_reranking"],
         "reranker_model": session["reranker_model"],
         "rerank_top_n": session["rerank_top_n"],
+        "use_self_rag": session["use_self_rag"],
+        "enable_query_rewriting": session["enable_query_rewriting"],
+        "enable_multi_hop": session["enable_multi_hop"],
+        "max_hops": session["max_hops"],
+        "confidence_threshold": session["confidence_threshold"],
     }
 
 
@@ -801,6 +819,7 @@ async def build_index(
     chunk_overlap: int = Form(100),
     temperature: float = Form(0.1),
     use_hybrid_search: bool = Form(False),
+    use_graph_rag: bool = Form(False),
     use_reranking: bool = Form(False),
     reranker_model: str = Form("cross-encoder/ms-marco-MiniLM-L-6-v2"),
     rerank_top_n: int = Form(10),
@@ -854,6 +873,7 @@ async def build_index(
         top_k=3,
         temperature=temperature,
         use_hybrid_search=use_hybrid_search,
+        use_graph_rag=use_graph_rag,
         use_reranking=use_reranking,
         reranker_model=reranker_model,
         rerank_top_n=rerank_top_n,
@@ -888,6 +908,7 @@ async def build_index(
     state.chunk_size = chunk_size
     state.chunk_overlap = chunk_overlap
     state.use_hybrid_search = use_hybrid_search
+    state.use_graph_rag = use_graph_rag
     state.use_reranking = use_reranking
     state.reranker_model = reranker_model
     state.rerank_top_n = rerank_top_n
@@ -910,6 +931,7 @@ async def build_index(
         embedding_model=embedding_model,
         temperature=temperature,
         use_hybrid_search=use_hybrid_search,
+        use_graph_rag=use_graph_rag,
         use_reranking=use_reranking,
         reranker_model=reranker_model,
         rerank_top_n=rerank_top_n,
@@ -928,6 +950,7 @@ async def build_index(
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
         "use_hybrid_search": use_hybrid_search,
+        "use_graph_rag": use_graph_rag,
         "use_reranking": use_reranking,
         "reranker_model": reranker_model if use_reranking else None,
         "rerank_top_n": rerank_top_n if use_reranking else None,
@@ -962,6 +985,7 @@ def ask(payload: AskPayload) -> dict:
                 confidence_threshold=state.confidence_threshold,
                 top_k=3,
                 use_hybrid_search=state.use_hybrid_search,
+                use_graph_rag=state.use_graph_rag,
                 use_reranking=state.use_reranking,
                 reranker_model=state.reranker_model,
                 rerank_top_n=state.rerank_top_n,
@@ -1157,6 +1181,7 @@ def clear_vector_store() -> dict:
     state.chunk_size = 1500
     state.chunk_overlap = 100
     state.use_hybrid_search = False
+    state.use_graph_rag = False
     state.current_session_id = None
     state.conversation_history = []
 
