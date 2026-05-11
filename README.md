@@ -193,6 +193,123 @@ curl -X POST http://localhost:8000/api/compare-retrieval \
 
 **Chi tiet day du**: Xem file [RERANKING_GUIDE.md](RERANKING_GUIDE.md)
 
+## OCR - Nhan Dien Chu Trong Anh (Moi!)
+
+He thong da tich hop **Optical Character Recognition (OCR)** de doc chu tu trong anh trong PDF/DOCX va nhan dien chu tren dau moc, watermark, seal.
+
+### Tinh nang chinh
+
+- 📸 **Trích xuất ảnh từ PDF/DOCX** - Tự động lấy tất cả ảnh từ tài liệu
+- 🔤 **Nhận diện chữ (OCR)** - Sử dụng RapidOCR, nhẹ và chạy tốt trên Windows
+- 🇻🇳 **Hỗ trợ Tiếng Việt** - Tối ưu cho tiếng Việt, Anh, Trung
+- 🖼️ **Cải thiện chất lượng ảnh** - Tự động denoise, normalize trước OCR
+- 🏷️ **Đọc chữ trên dấu mộc** - Nhận diện text từ watermark, seal, stamp
+- ⚙️ **GPU Support** - Tăng tốc nếu có NVIDIA GPU + CUDA
+
+### Cách cài đặt
+
+OCR được bao gồm trong `requirements.txt`. Nếu cài thủ công từng phần, chỉ cần:
+
+```bash
+pip install rapidocr-onnxruntime opencv-python
+```
+
+Lưu ý: project dùng `pypdfium2` để render PDF nên không cần cài Poppler như cách dùng `pdf2image` trên Windows.
+
+### Cách sử dụng
+
+#### Khi Build RAG Index:
+
+Trong form **Build RAG Index**, có các option:
+- **Enable OCR** - Bật/tắt OCR (mặc định: ON)
+- **OCR Confidence Threshold** - Độ tin cậy tối thiểu (0.0-1.0, mặc định: 0.3)
+- **OCR GPU** - Sử dụng GPU (mặc định: OFF, yêu cầu NVIDIA GPU + CUDA)
+- **Extract Images Only** - Chỉ lấy text từ ảnh, bỏ qua text thường (mặc định: OFF)
+
+#### API Call:
+
+```bash
+curl -X POST http://localhost:8000/api/build-index \
+  -F "files=@scanned_document.pdf" \
+  -F "use_ocr=true" \
+  -F "ocr_confidence_threshold=0.3" \
+  -F "ocr_gpu=false"
+```
+
+### Ngôn ngữ hỗ trợ
+
+- 🇻🇳 **Tiếng Việt** (vi) - Mặc định và tối ưu tốt
+- 🇬🇧 **English** (en) - Mặc định và độ chính xác cao
+- **Các ngôn ngữ khác** - Có thể cấu hình thêm cho từng bộ tài liệu nếu cần
+
+Mặc định project dùng `['vi', 'en']` để OCR ổn định trên PDF/DOCX và dấu mộc. RapidOCR chạy nhẹ hơn và phù hợp hơn cho môi trường Windows không có Poppler/Tesseract.
+
+### Performance
+
+| Phương pháp | Tốc độ | Chất lượng |
+|------------|-------|-----------|
+| CPU | 2-5s/ảnh | Tốt |
+| GPU (CUDA) | 0.5-1s/ảnh | Tốt |
+
+### Mẹo tối ưu OCR
+
+1. **Chất lượng ảnh**
+   - Sử dụng ảnh độ phân giải cao (300+ DPI cho scan)
+   - Tránh bóng, chói sáng quá mức
+   - Đảm bảo độ tương phản tốt
+
+2. **Kích thước chữ**
+   - Tối thiểu: 12px
+   - Tối ưu: 24px trở lên
+   - Ảnh hưởng lớn đến độ chính xác
+
+3. **Confidence Threshold**
+   - Thấp (0.1-0.2): Nhận nhiều text nhưng có thể sai
+   - Trung bình (0.3-0.5): Cân bằng tốt (khuyến nghị)
+   - Cao (0.7+): Chỉ text rất rõ ràng
+
+4. **GPU**
+   - Nếu có NVIDIA GPU + CUDA: Bật GPU để tăng tốc 5-10x
+   - Nếu không: Để OFF, sử dụng CPU
+
+### Tính hỗ trợ định dạng
+
+| Format | Ảnh trong tài liệu | Text thường | Trạng thái |
+|--------|------------------|------------|-----------|
+| PDF | ✅ OCR | ✅ Extract | Hỗ trợ đầy đủ |
+| DOCX | ✅ OCR | ✅ Extract | Hỗ trợ đầy đủ |
+
+### Ví dụ sử dụng
+
+#### Python:
+```python
+from rag_engine import RAGConfig, load_documents_from_files
+
+config = RAGConfig(
+    use_ocr=True,
+    ocr_languages=['vi', 'en'],
+    ocr_confidence_threshold=0.4,
+    ocr_gpu=False
+)
+
+with open('scan.pdf', 'rb') as f:
+    documents = load_documents_from_files(
+        file_items=[('scan.pdf', f.read())],
+        config=config
+    )
+
+print(f"Extracted {len(documents)} documents with OCR")
+```
+
+#### Chỉ lấy text từ ảnh (bỏ text thường):
+```python
+config = RAGConfig(
+    use_ocr=True,
+    extract_images_only=True,  # Chỉ OCR
+    ocr_confidence_threshold=0.5
+)
+```
+
 ## Tuy Chinh Chunk Parameters
 
 - Trong form Build RAG Index, co the chon cac gia tri sau.
