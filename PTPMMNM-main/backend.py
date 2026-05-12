@@ -59,13 +59,6 @@ class AppState:
         self.confidence_threshold = 0.7
         self.vectorstore = None  # Store vectorstore for Self-RAG
 
-        # OCR state for image text extraction
-        self.use_ocr = True  # Enable OCR for images in PDF/DOCX by default
-        self.ocr_languages = ['vi', 'en']  # Vietnamese and English are safe together by default
-        self.ocr_gpu = False  # Disable GPU by default (use CPU)
-        self.ocr_confidence_threshold = 0.3  # Minimum confidence for OCR text
-        self.extract_images_only = False  # Extract both text and images by default
-
 
 state = AppState()
 
@@ -747,11 +740,6 @@ def activate_session(session_id: int) -> dict:
         enable_multi_hop=session["enable_multi_hop"],
         max_hops=session["max_hops"],
         confidence_threshold=session["confidence_threshold"],
-        use_ocr=state.use_ocr,
-        ocr_languages=state.ocr_languages,
-        ocr_gpu=state.ocr_gpu,
-        ocr_confidence_threshold=state.ocr_confidence_threshold,
-        extract_images_only=state.extract_images_only,
     )
 
     try:
@@ -810,19 +798,7 @@ def get_session_file(session_id: int, file_name: str) -> FileResponse:
     if path is None:
         raise HTTPException(status_code=404, detail="File not found in this session.")
 
-    suffix = path.suffix.lower()
-    media_type_map = {
-        ".pdf": "application/pdf",
-        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".bmp": "image/bmp",
-        ".tif": "image/tiff",
-        ".tiff": "image/tiff",
-        ".webp": "image/webp",
-    }
-    media_type = media_type_map.get(suffix)
+    media_type = "application/pdf" if path.suffix.lower() == ".pdf" else None
     return FileResponse(
         path,
         media_type=media_type,
@@ -853,25 +829,18 @@ async def build_index(
     enable_multi_hop: bool = Form(False),
     max_hops: int = Form(3),
     confidence_threshold: float = Form(0.7),
-    # OCR parameters
-    use_ocr: bool = Form(True),
-    ocr_gpu: bool = Form(False),
-    ocr_confidence_threshold: float = Form(0.3),
-    extract_images_only: bool = Form(False),
 ) -> dict:
     if not files:
-        raise HTTPException(status_code=400, detail="Please upload at least one PDF, DOCX, or image file.")
-
-    supported_suffixes = (".pdf", ".docx", ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+        raise HTTPException(status_code=400, detail="Please upload at least one PDF or DOCX file.")
 
     doc_items = []
     file_records: List[Dict[str, Any]] = []
     for uploaded in files:
         lower_name = uploaded.filename.lower()
-        if not lower_name.endswith(supported_suffixes):
+        if not (lower_name.endswith(".pdf") or lower_name.endswith(".docx")):
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid file type: {uploaded.filename}. Supported: PDF, DOCX, PNG, JPG, JPEG, BMP, TIF, TIFF, WEBP.",
+                detail=f"Invalid file type: {uploaded.filename}. Only PDF and DOCX are supported.",
             )
         content = await uploaded.read()
         file_type = Path(uploaded.filename).suffix.lower().lstrip(".") or "unknown"
@@ -914,12 +883,6 @@ async def build_index(
         enable_multi_hop=enable_multi_hop,
         max_hops=max_hops,
         confidence_threshold=confidence_threshold,
-        # OCR settings
-        use_ocr=use_ocr,
-        ocr_languages=['vi', 'en'],
-        ocr_gpu=ocr_gpu,
-        ocr_confidence_threshold=ocr_confidence_threshold,
-        extract_images_only=extract_images_only,
     )
 
     try:
@@ -1026,12 +989,6 @@ def ask(payload: AskPayload) -> dict:
                 use_reranking=state.use_reranking,
                 reranker_model=state.reranker_model,
                 rerank_top_n=state.rerank_top_n,
-                # OCR settings
-                use_ocr=state.use_ocr,
-                ocr_languages=state.ocr_languages,
-                ocr_gpu=state.ocr_gpu,
-                ocr_confidence_threshold=state.ocr_confidence_threshold,
-                extract_images_only=state.extract_images_only,
             )
 
             answer, sources, metadata = ask_question_with_self_rag(
@@ -1141,12 +1098,6 @@ def compare_retrieval(payload: AskPayload) -> dict:
         use_reranking=True,
         reranker_model=state.reranker_model,
         rerank_top_n=state.rerank_top_n,
-        # OCR settings
-        use_ocr=state.use_ocr,
-        ocr_languages=state.ocr_languages,
-        ocr_gpu=state.ocr_gpu,
-        ocr_confidence_threshold=state.ocr_confidence_threshold,
-        extract_images_only=state.extract_images_only,
     )
 
     try:

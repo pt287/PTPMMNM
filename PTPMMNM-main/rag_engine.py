@@ -13,35 +13,21 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-# LangChain imports - handle different versions
-try:
-    from langchain_community.chains import RetrievalQA
-except ImportError:
-    try:
-        from langchain.chains import RetrievalQA
-    except ImportError:
-        RetrievalQA = None  # Will handle later
-
+from langchain_classic.chains import RetrievalQA
 from langchain_core.documents import Document
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.prompts import PromptTemplate
 from langchain_core.retrievers import BaseRetriever
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PDFPlumberLoader
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS
-
-try:
-    from langchain_community.retrievers import EnsembleRetriever
-except ImportError:
-    EnsembleRetriever = None
-
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaLLM
 from langdetect import LangDetectException, detect
 from docx import Document as DocxDocument
 from sentence_transformers import CrossEncoder
-from ocr_processor import OCRProcessor, OCRConfig
 
 
 @dataclass
@@ -72,18 +58,6 @@ class RAGConfig:
     enable_multi_hop: bool = False
     max_hops: int = 3  # Maximum retrieval iterations
     confidence_threshold: float = 0.7  # Minimum confidence to accept answer
-
-    # OCR configuration for image text extraction
-    use_ocr: bool = True  # Enable OCR for images in PDF/DOCX
-    ocr_languages: List[str] = None  # Languages for OCR (default: Vietnamese, English, Chinese)
-    ocr_gpu: bool = False  # Use GPU for OCR (slower on CPU, much faster with CUDA)
-    ocr_confidence_threshold: float = 0.3  # Minimum confidence score for OCR text
-    extract_images_only: bool = False  # Only extract text from images, skip regular text
-
-    def __post_init__(self):
-        """Initialize default values for mutable fields."""
-        if self.ocr_languages is None:
-            self.ocr_languages = ['vi', 'en', 'ch_sim']
 
 
 def _validate_config(config: RAGConfig) -> None:
@@ -193,26 +167,13 @@ def _similarity_search_with_optional_filter(
 def load_documents_from_files(
     file_items: Sequence[Tuple[str, bytes]],
     document_metadata: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
-    config: Optional[RAGConfig] = None,
 ):
-    """Load documents from supported document bytes (PDF, DOCX) with optional OCR.
-    
-    Args:
-        file_items: List of (filename, file_bytes) tuples
-        document_metadata: Optional metadata for each file
-        config: RAGConfig with OCR settings
-    """
-    if config is None:
-        config = RAGConfig()
+    """Load documents from supported document bytes (PDF, DOCX)."""
 
     documents = []
     temp_paths: List[str] = []
-    image_suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-
     try:
         metadata_items = list(document_metadata or [])
-
-        # First, extract regular text content from PDF/DOCX.
         for index, (file_name, file_bytes) in enumerate(file_items):
             base_metadata = metadata_items[index] if index < len(metadata_items) else None
             merged_metadata = _merge_document_metadata(file_name, extra_metadata=base_metadata)
@@ -223,61 +184,19 @@ def load_documents_from_files(
 
             temp_paths.append(tmp_path)
             ext = suffix.lower()
+            if ext == ".pdf":
+                loader = PDFPlumberLoader(tmp_path)
+                loaded_docs = loader.load()
+            elif ext == ".docx":
+                loaded_docs = _load_docx_with_python_docx(tmp_path, file_name)
+            else:
+                raise ValueError(f"Định dạng file chưa được hỗ trợ: {file_name}")
 
-            if not config.extract_images_only:
-                if ext == ".pdf":
-                    loader = PDFPlumberLoader(tmp_path)
-                    loaded_docs = loader.load()
-                elif ext == ".docx":
-                    loaded_docs = _load_docx_with_python_docx(tmp_path, file_name)
-                elif ext in image_suffixes and config.use_ocr:
-                    loaded_docs = []
-                else:
-                    raise ValueError(f"Định dạng file chưa được hỗ trợ: {file_name}")
+            for doc in loaded_docs:
+                doc.metadata = doc.metadata or {}
+                doc.metadata.update(merged_metadata)
 
-                for doc in loaded_docs:
-                    doc.metadata = doc.metadata or {}
-                    doc.metadata.update(merged_metadata)
-
-                documents.extend(loaded_docs)
-
-        # Second, extract text from images using OCR if enabled.
-        if config.use_ocr:
-            print("[*] Starting OCR extraction from images...")
-            ocr_config = OCRConfig(
-                languages=config.ocr_languages or ["vi", "en"],
-                gpu=config.ocr_gpu,
-                confidence_threshold=config.ocr_confidence_threshold,
-            )
-
-            for index, (file_name, file_bytes) in enumerate(file_items):
-                base_metadata = metadata_items[index] if index < len(metadata_items) else None
-                merged_metadata = _merge_document_metadata(file_name, extra_metadata=base_metadata)
-                suffix = os.path.splitext(file_name)[1].lower()
-
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".tmp") as tmp:
-                    tmp.write(file_bytes)
-                    tmp_path = tmp.name
-
-                try:
-                    if suffix == ".pdf":
-                        ocr_docs = OCRProcessor.process_pdf_with_ocr(tmp_path, ocr_config)
-                    elif suffix == ".docx":
-                        ocr_docs = OCRProcessor.process_docx_with_ocr(tmp_path, ocr_config)
-                    elif suffix in image_suffixes:
-                        ocr_docs = OCRProcessor.process_image_with_ocr(tmp_path, ocr_config)
-                    else:
-                        ocr_docs = []
-
-                    for doc in ocr_docs:
-                        doc.metadata = doc.metadata or {}
-                        doc.metadata.update(merged_metadata)
-                    documents.extend(ocr_docs)
-                finally:
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
+            documents.extend(loaded_docs)
 
         if not documents:
             raise ValueError("Không trích xuất được nội dung từ các file tải lên.")
@@ -824,7 +743,7 @@ def build_rag_pipeline(
     document_metadata: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
 ) -> Tuple[RetrievalQA, str, int]:
     _validate_config(config)
-    documents = load_documents_from_files(file_items, document_metadata=document_metadata, config=config)
+    documents = load_documents_from_files(file_items, document_metadata=document_metadata)
     language = detect_main_language(documents)
     chunks = split_documents(documents, config)
 
@@ -1282,93 +1201,6 @@ def _normalize_unknown_answer(answer: str, lang_code: str) -> str:
         return fallback
 
     return cleaned
-
-
-def _is_stamp_query(question: str) -> bool:
-    normalized = (question or "").casefold()
-    markers = [
-        "dấu mộc",
-        "dau moc",
-        "con dấu",
-        "con dau",
-        "dấu đỏ",
-        "dau do",
-        "stamp",
-        "seal",
-        "company seal",
-        "official seal",
-    ]
-    return any(marker in normalized for marker in markers)
-
-
-def _extract_stamp_text_from_documents(
-    documents: Sequence[Document],
-    question_lang: str,
-) -> Optional[str]:
-    if not documents:
-        return None
-
-    ocr_docs = [
-        doc
-        for doc in documents
-        if (doc.metadata or {}).get("source_type") in {"pdf_ocr", "docx_ocr"}
-    ]
-    if not ocr_docs:
-        return None
-
-    candidate_lines: List[str] = []
-    seen: set[str] = set()
-    for doc in ocr_docs:
-        text = (doc.page_content or "").strip()
-        if not text:
-            continue
-        for raw_line in text.splitlines():
-            line = re.sub(r"\s+", " ", raw_line).strip(" -:|;,._")
-            if len(line) < 2:
-                continue
-            if not re.search(r"[A-Za-zÀ-ỹ]", line):
-                continue
-            alpha_chars = [ch for ch in line if ch.isalpha()]
-            if not alpha_chars:
-                continue
-            uppercase_ratio = sum(1 for ch in alpha_chars if ch.isupper()) / len(alpha_chars)
-            # Seal text is typically uppercased, short, and rarely contains numeric business fields.
-            if uppercase_ratio < 0.55:
-                continue
-            if any(token in line for token in [":", "#", "VND", "vnd", "/"]):
-                continue
-            if any(ch.isdigit() for ch in line):
-                continue
-            if len(line) > 32:
-                continue
-            key = line.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            candidate_lines.append(line)
-
-    if not candidate_lines:
-        return None
-
-    def score_line(value: str) -> Tuple[int, int, int]:
-        uppercase_count = sum(1 for ch in value if ch.isalpha() and ch.isupper())
-        length_score = max(0, 36 - abs(18 - len(value)))
-        keyword_boost = 0
-        upper_value = value.upper()
-        for token in ["DOANH", "CONG", "CÔNG", "TY", "TN", "HUU", "HỮU", "DAT", "ĐẠT"]:
-            if token in upper_value:
-                keyword_boost += 2
-        return (keyword_boost, uppercase_count, length_score)
-
-    ranked = sorted(candidate_lines, key=score_line, reverse=True)
-    selected = ranked[:5]
-    if not selected:
-        return None
-
-    lang_code = _normalize_lang_code(question_lang)
-    if lang_code == "vi":
-        return f"Nội dung dấu mộc trong tài liệu: {', '.join(selected)}."
-    return f"The visible seal text in the document is: {', '.join(selected)}."
 
 
 def _normalize_page_number(page_value: Any, metadata: Dict[str, Any]) -> Any:
@@ -2018,21 +1850,14 @@ def ask_question_with_self_rag(
         metadata["retrieval_queries"] = used_queries
 
     # Step 4: Generate answer with retrieved context + conversation memory
-    stamp_answer = None
-    if _is_stamp_query(question):
-        stamp_answer = _extract_stamp_text_from_documents(list(retrieved_docs or []), question_lang)
-
-    if stamp_answer:
-        answer = stamp_answer
-    else:
-        answer = _generate_answer_from_documents(
-            llm,
-            question,
-            list(retrieved_docs or []),
-            question_lang,
-            doc_language,
-            conversation_history,
-        )
+    answer = _generate_answer_from_documents(
+        llm,
+        question,
+        list(retrieved_docs or []),
+        question_lang,
+        doc_language,
+        conversation_history,
+    )
 
     # Step 5: Self-evaluation (if enabled)
     if config.use_self_rag:
@@ -2089,20 +1914,13 @@ def ask_question(
         raise RuntimeError("Không thể sinh câu trả lời từ Ollama.") from last_error
 
     docs = _deduplicate_documents(list(docs or []))
-    stamp_answer = None
-    if _is_stamp_query(question):
-        stamp_answer = _extract_stamp_text_from_documents(docs, question_lang)
-
-    if stamp_answer:
-        answer = stamp_answer
-    else:
-        answer = _generate_answer_from_documents(
-            llm,
-            question,
-            list(docs or []),
-            question_lang,
-            doc_language,
-            conversation_history,
-        )
+    answer = _generate_answer_from_documents(
+        llm,
+        question,
+        list(docs or []),
+        question_lang,
+        doc_language,
+        conversation_history,
+    )
 
     return answer, _format_source_documents(docs, len(docs))
