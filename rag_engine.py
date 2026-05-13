@@ -20,7 +20,6 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.retrievers import BaseRetriever
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PDFPlumberLoader
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -28,6 +27,16 @@ from langchain_ollama import OllamaLLM
 from langdetect import LangDetectException, detect
 from docx import Document as DocxDocument
 from sentence_transformers import CrossEncoder
+
+try:
+    import pytesseract
+    # Đường dẫn mặc định khi cài Tesseract trên Windows
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    _OCR_AVAILABLE = True
+except ImportError:
+    _OCR_AVAILABLE = False
+
+_OCR_TEXT_THRESHOLD = 100  # ký tự — trang có ít hơn ngưỡng này sẽ được OCR thêm
 
 
 @dataclass
@@ -164,6 +173,43 @@ def _similarity_search_with_optional_filter(
     return vectorstore.similarity_search(query, k=k)
 
 
+def _ocr_image(pil_image: Any, lang: str = "vie+eng") -> str:
+    """OCR một PIL Image. Trả về chuỗi rỗng nếu pytesseract chưa cài."""
+    if not _OCR_AVAILABLE:
+        return ""
+    try:
+        return pytesseract.image_to_string(pil_image, lang=lang) or ""
+    except Exception:
+        return ""
+
+
+def _load_pdf_with_pdfplumber(tmp_path: str) -> List[Document]:
+    """Load PDF: extract text layer + OCR các trang ít chữ (ảnh, scan)."""
+    import pdfplumber
+
+    documents: List[Document] = []
+    with pdfplumber.open(tmp_path) as pdf:
+        for page_idx, page in enumerate(pdf.pages):
+            text = (page.extract_text() or "").strip()
+
+            if _OCR_AVAILABLE and len(text) < _OCR_TEXT_THRESHOLD:
+                try:
+                    pil_img = page.to_image(resolution=200).original
+                    ocr_text = _ocr_image(pil_img).strip()
+                    if ocr_text:
+                        text = (text + "\n" + ocr_text).strip() if text else ocr_text
+                except Exception:
+                    pass
+
+            if text:
+                documents.append(Document(
+                    page_content=text,
+                    metadata={"page": page_idx},
+                ))
+
+    return documents
+
+
 def load_documents_from_files(
     file_items: Sequence[Tuple[str, bytes]],
     document_metadata: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
@@ -185,8 +231,7 @@ def load_documents_from_files(
             temp_paths.append(tmp_path)
             ext = suffix.lower()
             if ext == ".pdf":
-                loader = PDFPlumberLoader(tmp_path)
-                loaded_docs = loader.load()
+                loaded_docs = _load_pdf_with_pdfplumber(tmp_path)
             elif ext == ".docx":
                 loaded_docs = _load_docx_with_python_docx(tmp_path, file_name)
             else:
