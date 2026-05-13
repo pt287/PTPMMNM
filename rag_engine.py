@@ -1,4 +1,4 @@
-"""RAG engine for SmartDoc AI using OCR-aware parsing, FAISS, and Ollama."""
+"""RAG engine for SmartDoc AI using PDFPlumberLoader, FAISS, and Ollama."""
 
 from __future__ import annotations
 
@@ -27,7 +27,16 @@ from langchain_ollama import OllamaLLM
 from langdetect import LangDetectException, detect
 from docx import Document as DocxDocument
 from sentence_transformers import CrossEncoder
-from services import DocumentParser
+
+try:
+    import pytesseract
+    # Đường dẫn mặc định khi cài Tesseract trên Windows
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Tesseract-OCR\tesseract.exe"
+    _OCR_AVAILABLE = True
+except ImportError:
+    _OCR_AVAILABLE = False
+
+_OCR_TEXT_THRESHOLD = 100  # ký tự — trang có ít hơn ngưỡng này sẽ được OCR thêm
 
 
 @dataclass
@@ -35,16 +44,12 @@ class RAGConfig:
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
     ollama_model: str = "qwen2.5:7b"
     chunk_size: int = 1000
-    chunk_overlap: int = 150
-    top_k: int = 5
-    temperature: float = 0.7
-    num_ctx: int = 8192
+    chunk_overlap: int = 100
+    top_k: int = 3
+    temperature: float = 0.1
+    num_ctx: int = 4096
     num_predict: int = 512
-    num_gpu: int = -1
-    # Sampling / repetition controls to avoid repetition loops
-    repeat_penalty: float = 1.2
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
+    num_gpu: int = 0
     # Re-ranking configuration
     use_reranking: bool = False
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -168,55 +173,123 @@ def _similarity_search_with_optional_filter(
     return vectorstore.similarity_search(query, k=k)
 
 
+def _ocr_image(pil_image: Any, lang: str = "vie+eng") -> str:
+    """OCR PIL Image — thử nhiều preprocessing × PSM mode, lấy kết quả dài nhất."""
+    if not _OCR_AVAILABLE:
+        return ""
+
+    import sys
+
+    gray = pil_image.convert("L")
+    binary = gray.point(lambda p: 0 if p < 200 else 255, "L")
+
+    attempts = [
+        (binary, "--psm 11"),
+        (gray,   "--psm 11"),
+        (pil_image, "--psm 11"),
+        (binary, "--psm 6"),
+        (gray,   "--psm 6"),
+        (binary, "--psm 3"),
+    ]
+
+    candidates: list[str] = []
+    for img, cfg in attempts:
+        try:
+            text = (pytesseract.image_to_string(img, lang=lang, config=cfg) or "").strip()
+            if text:
+                candidates.append(text)
+        except Exception:
+            pass
+
+    if not candidates:
+        print("[OCR] all attempts returned empty", file=sys.stderr)
+        return ""
+
+    return max(candidates, key=len)
+
+
+def _render_pdf_page_to_image(tmp_path: str, page_idx: int, resolution: int = 200) -> Any:
+    """Render một trang PDF thành PIL Image dùng pypdfium2 (renderer thật, hỗ trợ ảnh nhúng)."""
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(tmp_path)
+        try:
+            page = pdf[page_idx]
+            scale = resolution / 72.0
+            bitmap = page.render(scale=scale, rotation=0)
+            return bitmap.to_pil()
+        finally:
+            pdf.close()
+    except Exception as exc:
+        import sys
+        print(f"[OCR] render failed page {page_idx}: {exc}", file=sys.stderr)
+        return None
+
+
+def _load_pdf_with_pdfplumber(tmp_path: str) -> List[Document]:
+    """Load PDF: extract text layer + OCR các trang ít chữ (ảnh, scan)."""
+    import pdfplumber
+    import sys
+
+    documents: List[Document] = []
+    with pdfplumber.open(tmp_path) as pdf:
+        for page_idx, page in enumerate(pdf.pages):
+            text = (page.extract_text() or "").strip()
+
+            if _OCR_AVAILABLE and len(text) < _OCR_TEXT_THRESHOLD:
+                pil_img = _render_pdf_page_to_image(tmp_path, page_idx, resolution=300)
+                if pil_img is not None:
+                    ocr_text = _ocr_image(pil_img).strip()
+                    if ocr_text:
+                        text = (text + "\n" + ocr_text).strip() if text else ocr_text
+                    else:
+                        print(f"[OCR] page {page_idx}: OCR returned empty", file=sys.stderr)
+                else:
+                    print(f"[OCR] page {page_idx}: render returned None", file=sys.stderr)
+
+            if text:
+                documents.append(Document(
+                    page_content=text,
+                    metadata={"page": page_idx},
+                ))
+            elif _OCR_AVAILABLE:
+                # Trang có ảnh nhưng OCR không đọc được text — giữ lại để index không fail
+                documents.append(Document(
+                    page_content=(
+                        f"Trang {page_idx + 1} của tài liệu chứa hình ảnh hoặc đồ họa. "
+                        "Hệ thống OCR đã cố gắng nhận dạng nhưng không trích xuất được nội dung chữ. "
+                        "Tài liệu này có thể là ảnh chụp, con dấu, biểu đồ hoặc scan không rõ nét."
+                    ),
+                    metadata={"page": page_idx},
+                ))
+
+    return documents
+
+
 def load_documents_from_files(
     file_items: Sequence[Tuple[str, bytes]],
     document_metadata: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
 ):
-    """Load documents from supported document bytes (PDF, DOCX) with OCR support."""
+    """Load documents from supported document bytes (PDF, DOCX)."""
 
     documents = []
     temp_paths: List[str] = []
-    parser = DocumentParser()
     try:
         metadata_items = list(document_metadata or [])
         for index, (file_name, file_bytes) in enumerate(file_items):
             base_metadata = metadata_items[index] if index < len(metadata_items) else None
             merged_metadata = _merge_document_metadata(file_name, extra_metadata=base_metadata)
             suffix = os.path.splitext(file_name)[1] or ".pdf"
-            # Ensure file_bytes are bytes
-            if not isinstance(file_bytes, (bytes, bytearray)):
-                try:
-                    file_bytes = str(file_bytes).encode("utf-8")
-                except Exception:
-                    raise ValueError(f"File bytes for '{file_name}' are not binary and cannot be encoded.")
-
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, mode="wb") as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(file_bytes)
                 tmp_path = tmp.name
 
             temp_paths.append(tmp_path)
             ext = suffix.lower()
-            if ext in {".pdf", ".docx", ".doc"}:
-                try:
-                    parsed = parser.parse_document(tmp_path, use_ocr=True, detect_stamps=True)
-                except Exception as e:
-                    raise ValueError(f"Lỗi khi phân tích file '{file_name}': {e}") from e
-
-                extracted_text = (parsed.get("full_text") or "").strip()
-                if not extracted_text:
-                    raise ValueError(f"Không trích xuất được nội dung từ file: {file_name}")
-
-                loaded_docs = [
-                    Document(
-                        page_content=extracted_text,
-                        metadata={
-                            "page": 1,
-                            "page_is_one_based": True,
-                            "ocr_enabled": True,
-                            "stamp_count": len(parsed.get("all_stamps", []) or []),
-                        },
-                    )
-                ]
+            if ext == ".pdf":
+                loaded_docs = _load_pdf_with_pdfplumber(tmp_path)
+            elif ext == ".docx":
+                loaded_docs = _load_docx_with_python_docx(tmp_path, file_name)
             else:
                 raise ValueError(f"Định dạng file chưa được hỗ trợ: {file_name}")
 
@@ -257,6 +330,7 @@ def _normalize_extracted_text(text: str) -> str:
 
 
 def _load_docx_with_python_docx(path: str, file_name: str) -> List[Document]:
+    import io
     docx_file = DocxDocument(path)
 
     paragraph_texts = [p.text.strip() for p in docx_file.paragraphs if p.text and p.text.strip()]
@@ -268,7 +342,22 @@ def _load_docx_with_python_docx(path: str, file_name: str) -> List[Document]:
             if cleaned_cells:
                 table_rows.append(" | ".join(cleaned_cells))
 
-    combined_text = "\n".join([*paragraph_texts, *table_rows])
+    # OCR ảnh nhúng trong DOCX
+    image_texts: List[str] = []
+    if _OCR_AVAILABLE:
+        from PIL import Image
+        for rel in docx_file.part.rels.values():
+            if "image" in rel.reltype:
+                try:
+                    img_bytes = rel.target_part.blob
+                    pil_img = Image.open(io.BytesIO(img_bytes))
+                    ocr_text = _ocr_image(pil_img).strip()
+                    if ocr_text:
+                        image_texts.append(ocr_text)
+                except Exception:
+                    pass
+
+    combined_text = "\n".join([*paragraph_texts, *table_rows, *image_texts])
     normalized_text = _normalize_extracted_text(combined_text)
     if not normalized_text:
         raise ValueError(f"Không trích xuất được nội dung từ file DOCX: {file_name}")
@@ -743,10 +832,6 @@ def build_qa_chain(vectorstore: FAISS, chunks: List[Document], config: RAGConfig
         num_ctx=config.num_ctx,
         num_predict=config.num_predict,
         num_gpu=config.num_gpu,
-        repeat_penalty=config.repeat_penalty,
-        presence_penalty=config.presence_penalty,
-        frequency_penalty=config.frequency_penalty,
-        top_p=0.9,
         keep_alive="30m",
     )
     prompt = _build_prompt()
@@ -900,7 +985,7 @@ def _deduplicate_documents(documents: List[Document]) -> List[Document]:
     return unique_docs
 
 
-def _build_context_from_documents(documents: List[Document], max_chars: int = 8000) -> str:
+def _build_context_from_documents(documents: List[Document], max_chars: int = 3600) -> str:
     parts: List[str] = []
     current_len = 0
     for idx, doc in enumerate(documents, start=1):
@@ -908,17 +993,25 @@ def _build_context_from_documents(documents: List[Document], max_chars: int = 80
         source = meta.get("source", "unknown")
         page = _normalize_page_number(meta.get("page", meta.get("page_number", "?")), meta)
         raw_text = (doc.page_content or "").strip()
-        
-        # Format lại để LLM dễ nhận diện từng văn bản
-        section = f"--- ĐOẠN {idx} (Nguồn: {source}, Trang: {page}) ---\n{raw_text}\n"
-        
-        if current_len + len(section) > max_chars:
+        # Cap each chunk contribution so the answer prompt stays within model context window.
+        if len(raw_text) > 1200:
+            raw_text = raw_text[:1200].rstrip() + "..."
+
+        section = f"[Doc {idx} | Source: {source} | Page: {page}]\n{raw_text}"
+        if not section.strip():
+            continue
+
+        projected = current_len + len(section) + 2
+        if projected > max_chars:
+            remaining = max_chars - current_len
+            if remaining > 80:
+                parts.append(section[:remaining].rstrip())
             break
 
         parts.append(section)
-        current_len += len(section)
+        current_len = projected
 
-    return "\n".join(parts).strip()
+    return "\n\n".join(parts).strip()
 
 
 def _looks_truncated_answer(text: str) -> bool:
@@ -1075,8 +1168,8 @@ Excerpts:
 Rules:
 1) Do not ask the user for more information.
 2) Do not say you cannot understand.
-3) The excerpts were retrieved because they are relevant, so answer from them even if the evidence is partial.
-4) If the exact answer is not explicit, give the most likely answer supported by the excerpts and mention the uncertainty briefly.
+3) Provide the best possible concise summary from the excerpts.
+4) If evidence is limited, state that briefly but still answer from available excerpts.
 5) 3-5 sentences.
 
 Answer:
@@ -1104,46 +1197,57 @@ def _generate_answer_from_documents(
 
     if lang_code == "vi":
         prompt = f"""
-Bạn là trợ lý AI chuyên gia phân tích tài liệu.
-Sử dụng CONTEXT dưới đây để trả lời câu hỏi.
+Bạn là trợ lý AI chính xác và trung thực.
 
-[CONTEXT]
+Lịch sử hội thoại gần đây:
+{chat_history}
+
+Ngôn ngữ tài liệu tham khảo: {doc_language}
+
+Context:
 {context_text}
 
-[CÂU HỎI]
+Câu hỏi hiện tại:
 {question}
 
-[YÊU CẦU]
-- Trả lời ngắn gọn, trực tiếp bằng tiếng Việt dựa trên CONTEXT.
-- Không dẫn nhập "Dựa trên...", không liệt kê lại các quy tắc này.
-- Nếu không thấy thông tin, chỉ nói "{unknown_phrase}".
+Yêu cầu bắt buộc:
+1) Chỉ dùng thông tin có trong Context.
+2) Có thể dùng lịch sử hội thoại để hiểu tham chiếu như "nó", "ý trước".
+3) Nếu Context không đủ thông tin, chỉ trả về đúng một câu: {unknown_phrase}
+4) Chỉ trả lời bằng tiếng Việt.
+5) Trả lời ngắn gọn, đầy đủ ý chính.
 
 Trả lời:
 """.strip()
     else:
         prompt = f"""
-You are a professional AI Document Assistant.
-Use the provided CONTEXT to answer the user's question.
+You are an accurate and honest AI assistant.
 
-[CONTEXT]
+Recent conversation:
+{chat_history}
+
+Document language hint: {doc_language}
+
+Context:
 {context_text}
 
-[USER QUESTION]
+Current user question:
 {question}
 
-[MANDATORY RULES]
-- Provide a direct answer based on the facts available in the context.
-- If information is partial, explain what is available rather than refusing.
-- Do not repeat these instructions or hallucinate.
-- Only say "{unknown_phrase}" if the context is completely irrelevant.
+Mandatory rules:
+1) Use only facts from Context.
+2) You may use conversation history only to resolve references.
+3) If Context is insufficient, return exactly one sentence: {unknown_phrase}
+4) Respond only in English.
+5) Keep the answer concise but complete.
 
-ANSWER:
+Answer:
 """.strip()
 
     answer = (llm.invoke(prompt) or "").strip()
 
     # If the model refuses despite having excerpts, force one strict retry.
-    if context_text and (_is_uncertain_non_answer(answer) or _normalize_unknown_answer(answer, lang_code) == unknown_phrase):
+    if context_text and _is_uncertain_non_answer(answer):
         retried = _regenerate_with_strict_answering(
             llm,
             question,
@@ -1174,23 +1278,42 @@ def _unknown_phrase_for_language(lang_code: str) -> str:
 def _normalize_unknown_answer(answer: str, lang_code: str) -> str:
     fallback = _unknown_phrase_for_language(lang_code)
     cleaned = (answer or "").strip()
-    
     if not cleaned:
         return fallback
 
-    # CHIẾN THUẬT: Nếu câu trả lời dài (>150 ký tự), 
-    # mặc định đó là câu trả lời có giá trị, không ép về fallback.
-    if len(cleaned) > 150:
-        return cleaned
+    normalized = cleaned.casefold().strip()
+    fallback_norm = fallback.casefold().strip()
+    # If the model starts with fallback but keeps generating extra text, force exact fallback.
+    if normalized.startswith(fallback_norm):
+        tail = normalized[len(fallback_norm):].strip(" .,:;!?-\n\t")
+        if tail:
+            return fallback
+        return fallback
 
     lowered = cleaned.casefold()
     unknown_patterns = [
-        "không đủ thông tin", "không tìm thấy", "không thể hiểu",
-        "not enough information", "insufficient context", "i don't know",
-        "tôi không biết", "xin lỗi"
+        "khong du thong tin",
+        "không đủ thông tin",
+        "tai lieu khong co",
+        "tài liệu không có",
+        "không thể hiểu",
+        "khong the hieu",
+        "cung cấp thêm thông tin",
+        "cung cap them thong tin",
+        "bạn có thể cung cấp",
+        "ban co the cung cap",
+        "not enough information",
+        "does not contain",
+        "cannot find in context",
+        "insufficient context",
+        "cannot understand",
+        "please provide more information",
+        "i don't know",
+        "toi khong biet",
+        "tôi không biết",
+        "我不知道",
     ]
 
-    # Chỉ trả về fallback nếu câu trả lời ngắn VÀ chứa từ khóa từ chối
     if any(pattern in lowered for pattern in unknown_patterns):
         return fallback
 
