@@ -29,14 +29,25 @@ from docx import Document as DocxDocument
 from sentence_transformers import CrossEncoder
 
 try:
-    import pytesseract
-    # Đường dẫn mặc định khi cài Tesseract trên Windows
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    # python-bidi 0.4.x exposes get_display via bidi.algorithm, not bidi directly
+    import bidi
+    import bidi.algorithm
+    if not hasattr(bidi, "get_display"):
+        bidi.get_display = bidi.algorithm.get_display
+    import easyocr as _easyocr
     _OCR_AVAILABLE = True
-except ImportError:
+except Exception:
     _OCR_AVAILABLE = False
 
-_OCR_TEXT_THRESHOLD = 100  # ký tự — trang có ít hơn ngưỡng này sẽ được OCR thêm
+_OCR_TEXT_THRESHOLD = 100
+_ocr_reader = None
+
+
+def _get_ocr_reader():
+    global _ocr_reader
+    if _ocr_reader is None:
+        _ocr_reader = _easyocr.Reader(["vi"], gpu=False, verbose=False)
+    return _ocr_reader
 
 
 @dataclass
@@ -53,20 +64,18 @@ class RAGConfig:
     # Re-ranking configuration
     use_reranking: bool = False
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    rerank_top_n: int = 10  # Retrieve more candidates for re-ranking
+    rerank_top_n: int = 10
     use_hybrid_search: bool = False
     hybrid_semantic_weight: float = 0.7
     hybrid_keyword_weight: float = 0.3
     use_graph_rag: bool = False
     graph_expansion_hops: int = 1
     graph_max_related_chunks: int = 6
-
-    # Self-RAG configuration
     use_self_rag: bool = False
     enable_query_rewriting: bool = False
     enable_multi_hop: bool = False
-    max_hops: int = 3  # Maximum retrieval iterations
-    confidence_threshold: float = 0.7  # Minimum confidence to accept answer
+    max_hops: int = 3
+    confidence_threshold: float = 0.7
 
 
 def _validate_config(config: RAGConfig) -> None:
@@ -173,94 +182,115 @@ def _similarity_search_with_optional_filter(
     return vectorstore.similarity_search(query, k=k)
 
 
-def _ocr_image(pil_image: Any, lang: str = "vie+eng") -> str:
-    """OCR PIL Image — thử nhiều preprocessing × PSM mode, lấy kết quả dài nhất."""
+def _ocr_image(pil_image: Any) -> str:
     if not _OCR_AVAILABLE:
         return ""
-
-    import sys
-
-    gray = pil_image.convert("L")
-    binary = gray.point(lambda p: 0 if p < 200 else 255, "L")
-
-    attempts = [
-        (binary, "--psm 11"),
-        (gray,   "--psm 11"),
-        (pil_image, "--psm 11"),
-        (binary, "--psm 6"),
-        (gray,   "--psm 6"),
-        (binary, "--psm 3"),
-    ]
-
-    candidates: list[str] = []
-    for img, cfg in attempts:
-        try:
-            text = (pytesseract.image_to_string(img, lang=lang, config=cfg) or "").strip()
-            if text:
-                candidates.append(text)
-        except Exception:
-            pass
-
-    if not candidates:
-        print("[OCR] all attempts returned empty", file=sys.stderr)
+    try:
+        import numpy as np
+        results = _get_ocr_reader().readtext(np.array(pil_image.convert("RGB")), detail=0, paragraph=True)
+        return "\n".join(results).strip()
+    except Exception:
         return ""
-
-    return max(candidates, key=len)
 
 
 def _render_pdf_page_to_image(tmp_path: str, page_idx: int, resolution: int = 200) -> Any:
-    """Render một trang PDF thành PIL Image dùng pypdfium2 (renderer thật, hỗ trợ ảnh nhúng)."""
     try:
         import pypdfium2 as pdfium
         pdf = pdfium.PdfDocument(tmp_path)
         try:
-            page = pdf[page_idx]
-            scale = resolution / 72.0
-            bitmap = page.render(scale=scale, rotation=0)
+            bitmap = pdf[page_idx].render(scale=resolution / 72.0, rotation=0)
             return bitmap.to_pil()
         finally:
             pdf.close()
-    except Exception as exc:
-        import sys
-        print(f"[OCR] render failed page {page_idx}: {exc}", file=sys.stderr)
+    except Exception:
         return None
 
 
+def _words_to_text(word_list: list) -> str:
+    lines: List[str] = []
+    cur_line: List[str] = []
+    cur_top: Optional[float] = None
+    for w in sorted(word_list, key=lambda w: (round(w["top"] / 5) * 5, w["x0"])):
+        if cur_top is None or abs(w["top"] - cur_top) > 5:
+            if cur_line:
+                lines.append(" ".join(cur_line))
+            cur_line, cur_top = [w["text"]], w["top"]
+        else:
+            cur_line.append(w["text"])
+    if cur_line:
+        lines.append(" ".join(cur_line))
+    return "\n".join(lines)
+
+
+def _find_column_split(words: list, page_width: float) -> Optional[float]:
+    """Find the gutter x-position between two columns by locating the lowest-density gap."""
+    lo, hi = page_width * 0.30, page_width * 0.70
+    bin_size = 5.0
+    n_bins = max(1, int((hi - lo) / bin_size))
+    density = [0] * n_bins
+    for w in words:
+        idx = int((w["x0"] - lo) / bin_size)
+        if 0 <= idx < n_bins:
+            density[idx] += 1
+    avg = sum(density) / n_bins
+    if avg == 0:
+        return None
+    min_val = min(density)
+    if min_val > avg * 0.15:  # no clear gap → single column
+        return None
+    min_idx = density.index(min_val)
+    return lo + (min_idx + 0.5) * bin_size
+
+
+def _extract_page_text(page) -> str:
+    words = page.extract_words(x_tolerance=2, y_tolerance=3)
+    if not words:
+        return (page.extract_text() or "").strip()
+
+    split_x = _find_column_split(words, page.width)
+    if split_x is not None:
+        left = [w for w in words if w["x1"] <= split_x + 5]
+        right = [w for w in words if w["x0"] >= split_x - 5]
+        return (_words_to_text(left) + "\n\n" + _words_to_text(right)).strip()
+
+    return _words_to_text(words).strip()
+
+
 def _load_pdf_with_pdfplumber(tmp_path: str) -> List[Document]:
-    """Load PDF: extract text layer + OCR các trang ít chữ (ảnh, scan)."""
     import pdfplumber
-    import sys
 
     documents: List[Document] = []
+    table_counter = 0
     with pdfplumber.open(tmp_path) as pdf:
         for page_idx, page in enumerate(pdf.pages):
-            text = (page.extract_text() or "").strip()
+            text = _extract_page_text(page)
 
             if _OCR_AVAILABLE and len(text) < _OCR_TEXT_THRESHOLD:
                 pil_img = _render_pdf_page_to_image(tmp_path, page_idx, resolution=300)
                 if pil_img is not None:
-                    ocr_text = _ocr_image(pil_img).strip()
-                    if ocr_text:
-                        text = (text + "\n" + ocr_text).strip() if text else ocr_text
-                    else:
-                        print(f"[OCR] page {page_idx}: OCR returned empty", file=sys.stderr)
-                else:
-                    print(f"[OCR] page {page_idx}: render returned None", file=sys.stderr)
+                    ocr_text = _ocr_image(pil_img)
+                    text = f"{text}\n{ocr_text}".strip() if text else ocr_text
 
             if text:
+                documents.append(Document(page_content=text, metadata={"page": page_idx}))
+
+            # Each table → separate document with sequential numbering
+            for table in (page.extract_tables() or []):
+                rows = [
+                    " | ".join(str(cell).strip() if cell else "" for cell in row)
+                    for row in table
+                    if any(cell and str(cell).strip() for cell in row)
+                ]
+                if len(rows) < 2:  # skip chart labels / single-row artefacts
+                    continue
+                table_counter += 1
+                table_text = (
+                    f"Bảng {table_counter} (Trang {page_idx + 1}):\n"
+                    + "\n".join(rows)
+                )
                 documents.append(Document(
-                    page_content=text,
-                    metadata={"page": page_idx},
-                ))
-            elif _OCR_AVAILABLE:
-                # Trang có ảnh nhưng OCR không đọc được text — giữ lại để index không fail
-                documents.append(Document(
-                    page_content=(
-                        f"Trang {page_idx + 1} của tài liệu chứa hình ảnh hoặc đồ họa. "
-                        "Hệ thống OCR đã cố gắng nhận dạng nhưng không trích xuất được nội dung chữ. "
-                        "Tài liệu này có thể là ảnh chụp, con dấu, biểu đồ hoặc scan không rõ nét."
-                    ),
-                    metadata={"page": page_idx},
+                    page_content=table_text,
+                    metadata={"page": page_idx, "table_index": table_counter},
                 ))
 
     return documents
@@ -331,43 +361,33 @@ def _normalize_extracted_text(text: str) -> str:
 
 def _load_docx_with_python_docx(path: str, file_name: str) -> List[Document]:
     import io
+    from PIL import Image
+
     docx_file = DocxDocument(path)
 
-    paragraph_texts = [p.text.strip() for p in docx_file.paragraphs if p.text and p.text.strip()]
-    table_rows: List[str] = []
-    for table in docx_file.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            cleaned_cells = [cell for cell in cells if cell]
-            if cleaned_cells:
-                table_rows.append(" | ".join(cleaned_cells))
-
-    # OCR ảnh nhúng trong DOCX
-    image_texts: List[str] = []
+    paragraphs = [p.text.strip() for p in docx_file.paragraphs if p.text.strip()]
+    rows = [
+        " | ".join(c.text.strip() for c in row.cells if c.text.strip())
+        for table in docx_file.tables
+        for row in table.rows
+        if any(c.text.strip() for c in row.cells)
+    ]
+    images = []
     if _OCR_AVAILABLE:
-        from PIL import Image
         for rel in docx_file.part.rels.values():
             if "image" in rel.reltype:
                 try:
-                    img_bytes = rel.target_part.blob
-                    pil_img = Image.open(io.BytesIO(img_bytes))
-                    ocr_text = _ocr_image(pil_img).strip()
-                    if ocr_text:
-                        image_texts.append(ocr_text)
+                    text = _ocr_image(Image.open(io.BytesIO(rel.target_part.blob)))
+                    if text:
+                        images.append(text)
                 except Exception:
                     pass
 
-    combined_text = "\n".join([*paragraph_texts, *table_rows, *image_texts])
-    normalized_text = _normalize_extracted_text(combined_text)
-    if not normalized_text:
+    normalized = _normalize_extracted_text("\n".join([*paragraphs, *rows, *images]))
+    if not normalized:
         raise ValueError(f"Không trích xuất được nội dung từ file DOCX: {file_name}")
 
-    return [
-        Document(
-            page_content=normalized_text,
-            metadata={"page": 1, "page_is_one_based": True},
-        )
-    ]
+    return [Document(page_content=normalized, metadata={"page": 1, "page_is_one_based": True})]
 
 
 def detect_main_language(documents: Sequence[Any]) -> str:
@@ -532,13 +552,10 @@ def _get_embeddings(model_name: str) -> HuggingFaceEmbeddings:
 
 @lru_cache(maxsize=2)
 def _get_cross_encoder(model_name: str) -> CrossEncoder:
-    """Cache cross-encoder model instance to avoid cold-loading."""
     return CrossEncoder(model_name, max_length=512)
 
 
 class RerankingRetriever(BaseRetriever):
-    """Custom retriever that performs re-ranking with a cross-encoder."""
-
     vectorstore: FAISS
     documents: List[Document]
     config: RAGConfig
@@ -550,31 +567,18 @@ class RerankingRetriever(BaseRetriever):
     def _get_relevant_documents(
         self, query: str, *, run_manager: Optional[CallbackManagerForRetrieverRun] = None
     ) -> List[Document]:
-        """Retrieve documents with optional re-ranking."""
-        # Retrieve more candidates if re-ranking is enabled
         k = self.config.rerank_top_n if self.config.use_reranking else self.config.top_k
-
         search_filter = _sanitize_filter_metadata(self.filter_metadata)
-        # Get initial candidates using bi-encoder (FAISS)
-        initial_docs = _similarity_search_with_optional_filter(
-            self.vectorstore,
-            query,
-            k=k,
-            filter_metadata=search_filter,
+        initial_docs = filter_documents_by_metadata(
+            _similarity_search_with_optional_filter(self.vectorstore, query, k=k, filter_metadata=search_filter),
+            search_filter,
         )
-        initial_docs = filter_documents_by_metadata(initial_docs, search_filter)
-
         if not self.config.use_reranking or not initial_docs:
             return initial_docs[: self.config.top_k]
-
-        # Re-rank using cross-encoder
-        reranked_docs = rerank_documents(query, initial_docs, self.config)
-        return reranked_docs
+        return rerank_documents(query, initial_docs, self.config)
 
 
 class VectorSearchRetriever(BaseRetriever):
-    """Vector retriever with optional metadata filtering."""
-
     vectorstore: FAISS
     documents: List[Document]
     config: RAGConfig
@@ -597,8 +601,6 @@ class VectorSearchRetriever(BaseRetriever):
 
 
 class HybridSearchRetriever(BaseRetriever):
-    """Hybrid retriever that combines FAISS semantic search with BM25 keyword search."""
-
     vectorstore: FAISS
     documents: List[Document]
     config: RAGConfig
@@ -640,8 +642,6 @@ class HybridSearchRetriever(BaseRetriever):
 
 
 class GraphRAGRetriever(BaseRetriever):
-    """Retriever that expands retrieval candidates via a lightweight chunk graph."""
-
     vectorstore: FAISS
     documents: List[Document]
     config: RAGConfig
@@ -741,7 +741,6 @@ class GraphRAGRetriever(BaseRetriever):
 
         scored.sort(key=lambda item: item[0], reverse=True)
         expanded_docs = [doc for _, doc in scored]
-
         if not self.config.use_reranking:
             return expanded_docs[: self.config.top_k]
 
@@ -755,38 +754,16 @@ def rerank_documents(
     config: RAGConfig,
     return_scores: bool = False,
 ) -> List[Document] | Tuple[List[Document], List[float]]:
-    """
-    Re-rank documents using a cross-encoder model.
-
-    Args:
-        query: User query text
-        documents: List of documents to re-rank
-        config: RAG configuration with re-ranker settings
-        return_scores: If True, return (documents, scores) tuple
-
-    Returns:
-        Re-ranked documents (and scores if return_scores=True)
-    """
     if not documents:
         return ([], []) if return_scores else []
 
-    # Get cross-encoder model
-    cross_encoder = _get_cross_encoder(config.reranker_model)
-
-    # Prepare query-document pairs for scoring
     pairs = [[query, doc.page_content] for doc in documents]
+    scores = _get_cross_encoder(config.reranker_model).predict(pairs)
+    doc_score_pairs = sorted(zip(documents, scores), key=lambda x: x[1], reverse=True)
 
-    # Get relevance scores (higher is better)
-    scores = cross_encoder.predict(pairs)
-
-    # Sort documents by scores in descending order
-    doc_score_pairs = list(zip(documents, scores))
-    doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
-
-    # Return top_k documents
     top_k = min(config.top_k, len(documents))
     reranked_docs = [doc for doc, _ in doc_score_pairs[:top_k]]
-    reranked_scores = [float(score) for _, score in doc_score_pairs[:top_k]]
+    reranked_scores = [float(s) for _, s in doc_score_pairs[:top_k]]
 
     if return_scores:
         return reranked_docs, reranked_scores
@@ -914,10 +891,6 @@ def contextualize_question(
     llm: OllamaLLM,
     conversation_history: Optional[Sequence[Tuple[str, str]]] = None,
 ) -> Dict[str, Any]:
-    """
-    Rewrite follow-up questions into standalone questions using recent chat history.
-    """
-
     if not conversation_history:
         return {
             "original": question,
@@ -993,7 +966,6 @@ def _build_context_from_documents(documents: List[Document], max_chars: int = 36
         source = meta.get("source", "unknown")
         page = _normalize_page_number(meta.get("page", meta.get("page_number", "?")), meta)
         raw_text = (doc.page_content or "").strip()
-        # Cap each chunk contribution so the answer prompt stays within model context window.
         if len(raw_text) > 1200:
             raw_text = raw_text[:1200].rstrip() + "..."
 
@@ -1036,8 +1008,6 @@ def _looks_truncated_answer(text: str) -> bool:
     ]
     if any(lower_tail.endswith(marker) for marker in tail_markers):
         return True
-
-    # If output is long but does not end at sentence boundary, likely token cutoff.
     return len(cleaned) >= 120
 
 
@@ -1246,7 +1216,6 @@ Answer:
 
     answer = (llm.invoke(prompt) or "").strip()
 
-    # If the model refuses despite having excerpts, force one strict retry.
     if context_text and _is_uncertain_non_answer(answer):
         retried = _regenerate_with_strict_answering(
             llm,
@@ -1266,7 +1235,6 @@ Answer:
             response_language,
         )
 
-    # Ensure final response matches the user's language choice.
     answer = _maybe_translate_answer_to_target_language(llm, answer, lang_code)
     return _normalize_unknown_answer(answer, lang_code)
 
@@ -1283,7 +1251,6 @@ def _normalize_unknown_answer(answer: str, lang_code: str) -> str:
 
     normalized = cleaned.casefold().strip()
     fallback_norm = fallback.casefold().strip()
-    # If the model starts with fallback but keeps generating extra text, force exact fallback.
     if normalized.startswith(fallback_norm):
         tail = normalized[len(fallback_norm):].strip(" .,:;!?-\n\t")
         if tail:
@@ -1324,7 +1291,6 @@ def _normalize_page_number(page_value: Any, metadata: Dict[str, Any]) -> Any:
     if isinstance(page_value, int):
         if metadata.get("page_is_one_based"):
             return page_value
-        # PDF loader page index is 0-based, convert to user-facing 1-based.
         return page_value + 1 if page_value >= 0 else page_value
     return page_value
 
@@ -1337,16 +1303,12 @@ def _build_highlight_text(text: str, max_chars: int = 260) -> str:
 
 
 def _extract_llm_from_qa_chain(qa_chain: RetrievalQA) -> OllamaLLM:
-    """Resolve the underlying LLM from RetrievalQA across chain layouts."""
-
     combine_chain = getattr(qa_chain, "combine_documents_chain", None)
     if combine_chain is not None:
         llm_chain = getattr(combine_chain, "llm_chain", None)
         llm = getattr(llm_chain, "llm", None) if llm_chain is not None else None
         if llm is not None:
             return llm
-
-        # Fallback for older/alternative chain objects.
         llm = getattr(combine_chain, "llm", None)
         if llm is not None:
             return llm
@@ -1360,22 +1322,14 @@ def _extract_llm_from_qa_chain(qa_chain: RetrievalQA) -> OllamaLLM:
     if llm is not None:
         return llm
 
-    raise AttributeError(
-        "Unable to resolve LLM from RetrievalQA; expected "
-        "`qa_chain.combine_documents_chain.llm_chain.llm` for stuff chains."
-    )
+    raise AttributeError("Unable to resolve LLM from RetrievalQA.")
 
 
 def _retrieve_documents(retriever: Any, query: str) -> List[Document]:
-    """Retrieve documents with compatibility for classic and runnable retrievers."""
-
     if hasattr(retriever, "invoke"):
-        docs = retriever.invoke(query)
-        return list(docs or [])
-
+        return list(retriever.invoke(query) or [])
     if hasattr(retriever, "get_relevant_documents"):
         return retriever.get_relevant_documents(query)
-
     raise AttributeError("Retriever does not support `invoke` or `get_relevant_documents`.")
 
 
@@ -1490,18 +1444,6 @@ def rewrite_query(
     llm: OllamaLLM,
     language: str = "unknown",
 ) -> Dict[str, Any]:
-    """
-    Rewrite user query để cải thiện retrieval quality.
-
-    Strategies:
-    1. Expand với keywords liên quan
-    2. Rephrase cho rõ ràng hơn
-    3. Break down complex queries
-
-    Returns:
-        Dict với original query, rewritten query, và metadata
-    """
-
     prompt_template = """
 You are a query optimizer for RAG retrieval.
 Bạn là công cụ tối ưu câu hỏi cho truy hồi RAG.
@@ -1529,7 +1471,6 @@ Rewritten query:
             "language": language,
         }
     except Exception:
-        # Fallback to original query
         return {
             "original": original_query,
             "rewritten": original_query,
@@ -1544,19 +1485,6 @@ def evaluate_answer_quality(
     context_documents: List[Document],
     llm: OllamaLLM,
 ) -> Dict[str, Any]:
-    """
-    Self-RAG: LLM tự đánh giá chất lượng câu trả lời.
-
-    Evaluation criteria:
-    1. Grounding: Câu trả lời có dựa trên context không?
-    2. Relevance: Câu trả lời có trả lời đúng câu hỏi không?
-    3. Completeness: Câu trả lời có đầy đủ không?
-
-    Returns:
-        Dict với scores và critique
-    """
-
-    # Build context text
     context_text = "\n\n".join([
         f"Document {i+1}: {doc.page_content[:200]}..."
         for i, doc in enumerate(context_documents[:3])
@@ -1594,27 +1522,20 @@ Return only 3 numbers, one per line. Example:
 
         evaluation_text = llm.invoke(prompt).strip()
 
-        # Parse scores
         lines = [line.strip() for line in evaluation_text.split('\n') if line.strip()]
         scores = []
-        for line in lines[:3]:  # Take first 3 lines
+        for line in lines[:3]:
             try:
-                score = float(line)
-                scores.append(min(10.0, max(0.0, score)))  # Clamp to 0-10
+                scores.append(min(10.0, max(0.0, float(line))))
             except ValueError:
-                # Try to extract number from line
-                import re
                 numbers = re.findall(r'\d+\.?\d*', line)
                 if numbers:
                     scores.append(min(10.0, max(0.0, float(numbers[0]))))
 
-        # Ensure we have 3 scores
         while len(scores) < 3:
-            scores.append(5.0)  # Default middle score
+            scores.append(5.0)
 
         grounding, relevance, completeness = scores[:3]
-
-        # Calculate overall confidence (0-1)
         confidence = (grounding + relevance + completeness) / 30.0
 
         return {
@@ -1622,11 +1543,10 @@ Return only 3 numbers, one per line. Example:
             "relevance_score": relevance,
             "completeness_score": completeness,
             "confidence": confidence,
-            "passed": confidence >= 0.7,  # Threshold
+            "passed": confidence >= 0.7,
         }
 
     except Exception as e:
-        # Fallback: Assume moderate quality
         return {
             "grounding_score": 7.0,
             "relevance_score": 7.0,
@@ -1646,21 +1566,6 @@ def multi_hop_retrieval(
     filter_metadata: Optional[Dict[str, Any]] = None,
     retriever: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """
-    Multi-hop reasoning: Iterative retrieval cho câu hỏi phức tạp.
-
-    Process:
-    1. Retrieve initial documents
-    2. Generate partial answer
-    3. Nếu cần thêm info → generate follow-up query
-    4. Retrieve more documents
-    5. Refine answer
-    6. Repeat until confident hoặc max hops
-
-    Returns:
-        Dict với final answer, all documents, và hop history
-    """
-
     all_documents = []
     hop_history = []
     current_query = original_query
@@ -1675,7 +1580,6 @@ def multi_hop_retrieval(
             finally:
                 _restore_retriever_filter(retriever, previous_filter)
         elif config.use_reranking:
-            # Use re-ranking if enabled
             candidates = _similarity_search_with_optional_filter(
                 vectorstore,
                 current_query,
@@ -1695,7 +1599,6 @@ def multi_hop_retrieval(
 
         all_documents.extend(hop_docs)
 
-        # Generate partial answer
         context_text = "\n\n".join([doc.page_content for doc in all_documents])
 
         answer_prompt = f"""
@@ -1716,7 +1619,6 @@ Context:
 
         partial_answer = llm.invoke(answer_prompt).strip()
 
-        # Check if we need more information
         need_more_info = any(phrase in partial_answer.lower() for phrase in [
             "cần thêm", "thiếu thông tin", "không đủ", "need more", "insufficient"
         ])
@@ -1730,7 +1632,6 @@ Context:
         })
 
         if not need_more_info:
-            # Có đủ thông tin, dừng
             return {
                 "final_answer": partial_answer,
                 "total_hops": hop + 1,
@@ -1740,7 +1641,6 @@ Context:
             }
 
         if hop < max_hops - 1:
-            # Generate follow-up query
             followup_prompt = f"""
 Original question: {original_query}
 Current findings: {partial_answer}
@@ -1753,13 +1653,12 @@ Follow-up query:
 
             current_query = llm.invoke(followup_prompt).strip()
 
-    # Reached max hops
     return {
         "final_answer": partial_answer,
         "total_hops": max_hops,
         "all_documents": all_documents,
         "hop_history": hop_history,
-        "completed": False,  # Không đạt được answer đầy đủ
+        "completed": False,
     }
 
 
@@ -1770,30 +1669,19 @@ def compare_retrieval_methods(
     config: RAGConfig,
     filter_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Compare pure vector search, hybrid search, and optional re-ranking performance.
-
-    Returns:
-        Dictionary with comparison metrics and retrieved documents
-    """
     start_time = time.time()
     search_filter = _sanitize_filter_metadata(filter_metadata)
 
     vector_retriever = VectorSearchRetriever(
-        vectorstore=vectorstore,
-        documents=list(documents),
-        config=config,
-        filter_metadata=search_filter,
+        vectorstore=vectorstore, documents=list(documents), config=config, filter_metadata=search_filter,
     )
-    hybrid_config = RAGConfig(**{**config.__dict__, "use_hybrid_search": True, "use_reranking": False})
     hybrid_retriever = HybridSearchRetriever(
         vectorstore=vectorstore,
         documents=list(documents),
-        config=hybrid_config,
+        config=RAGConfig(**{**config.__dict__, "use_hybrid_search": True, "use_reranking": False}),
         filter_metadata=search_filter,
     )
 
-    # Bi-encoder only retrieval
     bi_encoder_start = time.time()
     bi_encoder_docs = vector_retriever.invoke(query)
     bi_encoder_time = time.time() - bi_encoder_start
@@ -1802,22 +1690,15 @@ def compare_retrieval_methods(
     hybrid_docs = hybrid_retriever.invoke(query)
     hybrid_time = time.time() - hybrid_start
 
-    # Retrieve more candidates for re-ranking
     retrieval_start = time.time()
-    candidate_docs = _similarity_search_with_optional_filter(
-        vectorstore,
-        query,
-        k=config.rerank_top_n,
-        filter_metadata=search_filter,
+    candidate_docs = filter_documents_by_metadata(
+        _similarity_search_with_optional_filter(vectorstore, query, k=config.rerank_top_n, filter_metadata=search_filter),
+        search_filter,
     )
-    candidate_docs = filter_documents_by_metadata(candidate_docs, search_filter)
     retrieval_time = time.time() - retrieval_start
 
-    # Cross-encoder re-ranking
     rerank_start = time.time()
-    reranked_docs, rerank_scores = rerank_documents(
-        query, candidate_docs, config, return_scores=True
-    )
+    reranked_docs, rerank_scores = rerank_documents(query, candidate_docs, config, return_scores=True)
     rerank_time = time.time() - rerank_start
 
     total_time = time.time() - start_time
@@ -1893,19 +1774,6 @@ def ask_question_with_self_rag(
     filter_metadata: Optional[Dict[str, Any]] = None,
     doc_language: str = "unknown",
 ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Advanced RAG với Self-RAG capabilities.
-
-    Features:
-    1. Query rewriting (optional)
-    2. Multi-hop reasoning (optional)
-    3. Answer quality evaluation
-    4. Confidence scoring
-
-    Returns:
-        (answer, sources, metadata)
-    """
-
     metadata = {
         "used_self_rag": config.use_self_rag,
         "query_rewriting": config.enable_query_rewriting,
@@ -1913,15 +1781,12 @@ def ask_question_with_self_rag(
         "filter_metadata": _sanitize_filter_metadata(filter_metadata),
     }
 
-    # Get LLM from qa_chain in a version-compatible way.
     llm = _extract_llm_from_qa_chain(qa_chain)
 
-    # Step 1: Contextualize follow-up question from chat memory.
     contextualized = contextualize_question(question, llm, conversation_history)
     working_query = contextualized["standalone"]
     metadata["contextualization"] = contextualized
 
-    # Step 2: Query rewriting (if enabled)
     if config.use_self_rag and config.enable_query_rewriting:
         rewrite_result = rewrite_query(
             working_query,
@@ -1933,7 +1798,6 @@ def ask_question_with_self_rag(
     else:
         metadata["query_rewrite"] = None
 
-    # Step 3: Retrieval (multi-hop or single-hop)
     question_lang = resolve_response_language(question, doc_language)
 
     if config.use_self_rag and config.enable_multi_hop:
@@ -1966,7 +1830,6 @@ def ask_question_with_self_rag(
         metadata["multi_hop"] = None
         metadata["retrieval_queries"] = used_queries
 
-    # Step 4: Generate answer with retrieved context + conversation memory
     answer = _generate_answer_from_documents(
         llm,
         question,
@@ -1976,7 +1839,6 @@ def ask_question_with_self_rag(
         conversation_history,
     )
 
-    # Step 5: Self-evaluation (if enabled)
     if config.use_self_rag:
         evaluation = evaluate_answer_quality(
             question,
@@ -2023,7 +1885,6 @@ def ask_question(
             break
         except Exception as exc:
             last_error = exc
-            # Ollama runner can terminate transiently; retry once.
             if "llama runner process has terminated" not in str(exc) or attempt == 1:
                 raise
             time.sleep(0.25)
