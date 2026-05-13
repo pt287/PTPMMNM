@@ -1,4 +1,4 @@
-"""RAG engine for SmartDoc AI using PDFPlumberLoader, FAISS, and Ollama."""
+"""RAG engine for SmartDoc AI using OCR-aware parsing, FAISS, and Ollama."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.retrievers import BaseRetriever
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PDFPlumberLoader
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -28,6 +27,7 @@ from langchain_ollama import OllamaLLM
 from langdetect import LangDetectException, detect
 from docx import Document as DocxDocument
 from sentence_transformers import CrossEncoder
+from services import DocumentParser
 
 
 @dataclass
@@ -35,12 +35,16 @@ class RAGConfig:
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
     ollama_model: str = "qwen2.5:7b"
     chunk_size: int = 1000
-    chunk_overlap: int = 100
-    top_k: int = 3
-    temperature: float = 0.1
-    num_ctx: int = 4096
+    chunk_overlap: int = 150
+    top_k: int = 5
+    temperature: float = 0.7
+    num_ctx: int = 8192
     num_predict: int = 512
-    num_gpu: int = 0
+    num_gpu: int = -1
+    # Sampling / repetition controls to avoid repetition loops
+    repeat_penalty: float = 1.2
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
     # Re-ranking configuration
     use_reranking: bool = False
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -168,27 +172,51 @@ def load_documents_from_files(
     file_items: Sequence[Tuple[str, bytes]],
     document_metadata: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
 ):
-    """Load documents from supported document bytes (PDF, DOCX)."""
+    """Load documents from supported document bytes (PDF, DOCX) with OCR support."""
 
     documents = []
     temp_paths: List[str] = []
+    parser = DocumentParser()
     try:
         metadata_items = list(document_metadata or [])
         for index, (file_name, file_bytes) in enumerate(file_items):
             base_metadata = metadata_items[index] if index < len(metadata_items) else None
             merged_metadata = _merge_document_metadata(file_name, extra_metadata=base_metadata)
             suffix = os.path.splitext(file_name)[1] or ".pdf"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            # Ensure file_bytes are bytes
+            if not isinstance(file_bytes, (bytes, bytearray)):
+                try:
+                    file_bytes = str(file_bytes).encode("utf-8")
+                except Exception:
+                    raise ValueError(f"File bytes for '{file_name}' are not binary and cannot be encoded.")
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, mode="wb") as tmp:
                 tmp.write(file_bytes)
                 tmp_path = tmp.name
 
             temp_paths.append(tmp_path)
             ext = suffix.lower()
-            if ext == ".pdf":
-                loader = PDFPlumberLoader(tmp_path)
-                loaded_docs = loader.load()
-            elif ext == ".docx":
-                loaded_docs = _load_docx_with_python_docx(tmp_path, file_name)
+            if ext in {".pdf", ".docx", ".doc"}:
+                try:
+                    parsed = parser.parse_document(tmp_path, use_ocr=True, detect_stamps=True)
+                except Exception as e:
+                    raise ValueError(f"Lỗi khi phân tích file '{file_name}': {e}") from e
+
+                extracted_text = (parsed.get("full_text") or "").strip()
+                if not extracted_text:
+                    raise ValueError(f"Không trích xuất được nội dung từ file: {file_name}")
+
+                loaded_docs = [
+                    Document(
+                        page_content=extracted_text,
+                        metadata={
+                            "page": 1,
+                            "page_is_one_based": True,
+                            "ocr_enabled": True,
+                            "stamp_count": len(parsed.get("all_stamps", []) or []),
+                        },
+                    )
+                ]
             else:
                 raise ValueError(f"Định dạng file chưa được hỗ trợ: {file_name}")
 
@@ -715,6 +743,10 @@ def build_qa_chain(vectorstore: FAISS, chunks: List[Document], config: RAGConfig
         num_ctx=config.num_ctx,
         num_predict=config.num_predict,
         num_gpu=config.num_gpu,
+        repeat_penalty=config.repeat_penalty,
+        presence_penalty=config.presence_penalty,
+        frequency_penalty=config.frequency_penalty,
+        top_p=0.9,
         keep_alive="30m",
     )
     prompt = _build_prompt()
@@ -868,7 +900,7 @@ def _deduplicate_documents(documents: List[Document]) -> List[Document]:
     return unique_docs
 
 
-def _build_context_from_documents(documents: List[Document], max_chars: int = 3600) -> str:
+def _build_context_from_documents(documents: List[Document], max_chars: int = 8000) -> str:
     parts: List[str] = []
     current_len = 0
     for idx, doc in enumerate(documents, start=1):
@@ -876,25 +908,17 @@ def _build_context_from_documents(documents: List[Document], max_chars: int = 36
         source = meta.get("source", "unknown")
         page = _normalize_page_number(meta.get("page", meta.get("page_number", "?")), meta)
         raw_text = (doc.page_content or "").strip()
-        # Cap each chunk contribution so the answer prompt stays within model context window.
-        if len(raw_text) > 1200:
-            raw_text = raw_text[:1200].rstrip() + "..."
-
-        section = f"[Doc {idx} | Source: {source} | Page: {page}]\n{raw_text}"
-        if not section.strip():
-            continue
-
-        projected = current_len + len(section) + 2
-        if projected > max_chars:
-            remaining = max_chars - current_len
-            if remaining > 80:
-                parts.append(section[:remaining].rstrip())
+        
+        # Format lại để LLM dễ nhận diện từng văn bản
+        section = f"--- ĐOẠN {idx} (Nguồn: {source}, Trang: {page}) ---\n{raw_text}\n"
+        
+        if current_len + len(section) > max_chars:
             break
 
         parts.append(section)
-        current_len = projected
+        current_len += len(section)
 
-    return "\n\n".join(parts).strip()
+    return "\n".join(parts).strip()
 
 
 def _looks_truncated_answer(text: str) -> bool:
@@ -1051,8 +1075,8 @@ Excerpts:
 Rules:
 1) Do not ask the user for more information.
 2) Do not say you cannot understand.
-3) Provide the best possible concise summary from the excerpts.
-4) If evidence is limited, state that briefly but still answer from available excerpts.
+3) The excerpts were retrieved because they are relevant, so answer from them even if the evidence is partial.
+4) If the exact answer is not explicit, give the most likely answer supported by the excerpts and mention the uncertainty briefly.
 5) 3-5 sentences.
 
 Answer:
@@ -1080,57 +1104,46 @@ def _generate_answer_from_documents(
 
     if lang_code == "vi":
         prompt = f"""
-Bạn là trợ lý AI chính xác và trung thực.
+Bạn là trợ lý AI chuyên gia phân tích tài liệu.
+Sử dụng CONTEXT dưới đây để trả lời câu hỏi.
 
-Lịch sử hội thoại gần đây:
-{chat_history}
-
-Ngôn ngữ tài liệu tham khảo: {doc_language}
-
-Context:
+[CONTEXT]
 {context_text}
 
-Câu hỏi hiện tại:
+[CÂU HỎI]
 {question}
 
-Yêu cầu bắt buộc:
-1) Chỉ dùng thông tin có trong Context.
-2) Có thể dùng lịch sử hội thoại để hiểu tham chiếu như "nó", "ý trước".
-3) Nếu Context không đủ thông tin, chỉ trả về đúng một câu: {unknown_phrase}
-4) Chỉ trả lời bằng tiếng Việt.
-5) Trả lời ngắn gọn, đầy đủ ý chính.
+[YÊU CẦU]
+- Trả lời ngắn gọn, trực tiếp bằng tiếng Việt dựa trên CONTEXT.
+- Không dẫn nhập "Dựa trên...", không liệt kê lại các quy tắc này.
+- Nếu không thấy thông tin, chỉ nói "{unknown_phrase}".
 
 Trả lời:
 """.strip()
     else:
         prompt = f"""
-You are an accurate and honest AI assistant.
+You are a professional AI Document Assistant.
+Use the provided CONTEXT to answer the user's question.
 
-Recent conversation:
-{chat_history}
-
-Document language hint: {doc_language}
-
-Context:
+[CONTEXT]
 {context_text}
 
-Current user question:
+[USER QUESTION]
 {question}
 
-Mandatory rules:
-1) Use only facts from Context.
-2) You may use conversation history only to resolve references.
-3) If Context is insufficient, return exactly one sentence: {unknown_phrase}
-4) Respond only in English.
-5) Keep the answer concise but complete.
+[MANDATORY RULES]
+- Provide a direct answer based on the facts available in the context.
+- If information is partial, explain what is available rather than refusing.
+- Do not repeat these instructions or hallucinate.
+- Only say "{unknown_phrase}" if the context is completely irrelevant.
 
-Answer:
+ANSWER:
 """.strip()
 
     answer = (llm.invoke(prompt) or "").strip()
 
     # If the model refuses despite having excerpts, force one strict retry.
-    if context_text and _is_uncertain_non_answer(answer):
+    if context_text and (_is_uncertain_non_answer(answer) or _normalize_unknown_answer(answer, lang_code) == unknown_phrase):
         retried = _regenerate_with_strict_answering(
             llm,
             question,
@@ -1161,42 +1174,23 @@ def _unknown_phrase_for_language(lang_code: str) -> str:
 def _normalize_unknown_answer(answer: str, lang_code: str) -> str:
     fallback = _unknown_phrase_for_language(lang_code)
     cleaned = (answer or "").strip()
+    
     if not cleaned:
         return fallback
 
-    normalized = cleaned.casefold().strip()
-    fallback_norm = fallback.casefold().strip()
-    # If the model starts with fallback but keeps generating extra text, force exact fallback.
-    if normalized.startswith(fallback_norm):
-        tail = normalized[len(fallback_norm):].strip(" .,:;!?-\n\t")
-        if tail:
-            return fallback
-        return fallback
+    # CHIẾN THUẬT: Nếu câu trả lời dài (>150 ký tự), 
+    # mặc định đó là câu trả lời có giá trị, không ép về fallback.
+    if len(cleaned) > 150:
+        return cleaned
 
     lowered = cleaned.casefold()
     unknown_patterns = [
-        "khong du thong tin",
-        "không đủ thông tin",
-        "tai lieu khong co",
-        "tài liệu không có",
-        "không thể hiểu",
-        "khong the hieu",
-        "cung cấp thêm thông tin",
-        "cung cap them thong tin",
-        "bạn có thể cung cấp",
-        "ban co the cung cap",
-        "not enough information",
-        "does not contain",
-        "cannot find in context",
-        "insufficient context",
-        "cannot understand",
-        "please provide more information",
-        "i don't know",
-        "toi khong biet",
-        "tôi không biết",
-        "我不知道",
+        "không đủ thông tin", "không tìm thấy", "không thể hiểu",
+        "not enough information", "insufficient context", "i don't know",
+        "tôi không biết", "xin lỗi"
     ]
 
+    # Chỉ trả về fallback nếu câu trả lời ngắn VÀ chứa từ khóa từ chối
     if any(pattern in lowered for pattern in unknown_patterns):
         return fallback
 

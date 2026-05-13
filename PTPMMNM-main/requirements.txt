@@ -127,3 +127,9 @@ websockets==16.0
 xxhash==3.6.0
 yarl==1.23.0
 zstandard==0.25.0
+
+# OCR and Image Processing
+easyocr==1.7.1
+opencv-python==4.8.1.78
+pdf2image==1.16.3
+pymupdf

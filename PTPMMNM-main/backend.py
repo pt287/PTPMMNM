@@ -3,6 +3,7 @@ import json
 import sqlite3
 import shutil
 import unicodedata
+import logging
 from threading import Lock
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -19,11 +20,20 @@ from rag_engine import (
     build_rag_pipeline,
     compare_retrieval_methods,
 )
+from services import DocumentParser, OCRService, StampDetector
+
+logger = logging.getLogger(__name__)
 
 
 class AskPayload(BaseModel):
     question: str
     filter_metadata: Optional[Dict[str, Any]] = None
+
+
+class OCRProcessPayload(BaseModel):
+    use_ocr: bool = True
+    detect_stamps: bool = True
+    file_type: Optional[str] = None  # 'pdf' or 'docx'
 
 
 app = FastAPI(title="SmartDoc AI API")
@@ -1190,3 +1200,204 @@ def clear_vector_store() -> dict:
         "removed_sessions": result["removed_sessions"],
         "removed_files": result["removed_files"],
     }
+
+
+# ============================================================================
+# OCR & Document Processing Endpoints
+# ============================================================================
+
+@app.post("/api/process-document")
+async def process_document(
+    file: UploadFile = File(...),
+    use_ocr: bool = Form(True),
+    detect_stamps: bool = Form(True),
+) -> dict:
+    """
+    Process PDF/DOCX with OCR support.
+    
+    - Extract text from PDF/DOCX
+    - If PDF scan (no text layer), use EasyOCR
+    - Detect stamps/seals (dấu mộc)
+    - Return full text + detected stamps
+    """
+    try:
+        if file.filename is None:
+            raise ValueError("File name is required")
+        
+        # Validate file type
+        file_ext = Path(file.filename).suffix.lower()
+        if file_ext not in [".pdf", ".docx", ".doc"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {file_ext}. Please upload PDF or DOCX."
+            )
+        
+        logger.info(f"Processing document: {file.filename}")
+        
+        # Save file temporarily
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = uploads_dir / file.filename
+        
+        content = await file.read()
+        with open(temp_path, "wb") as f:
+            f.write(content)
+        
+        # Parse document
+        parser = DocumentParser()
+        result = parser.parse_document(
+            str(temp_path),
+            use_ocr=use_ocr,
+            detect_stamps=detect_stamps
+        )
+        
+        # Clean up
+        try:
+            temp_path.unlink()
+        except:
+            pass
+        
+        return {
+            "success": True,
+            "file_name": file.filename,
+            "file_size": len(content),
+            "document_type": result.get("document_type"),
+            "full_text": result.get("full_text", ""),
+            "text_length": len(result.get("full_text", "")),
+            "stamps": result.get("all_stamps", []),
+            "stamp_count": len(result.get("all_stamps", [])),
+            "pages": result.get("pages"),
+            "extracted_images": result.get("extracted_images"),
+            "metadata": result.get("metadata", {}),
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error processing document: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing document: {str(exc)}"
+        ) from exc
+
+
+@app.post("/api/extract-text")
+async def extract_text_from_file(file: UploadFile = File(...)) -> dict:
+    """
+    Extract text from document (simpler than process-document).
+    """
+    try:
+        if file.filename is None:
+            raise ValueError("File name is required")
+        
+        file_ext = Path(file.filename).suffix.lower()
+        if file_ext not in [".pdf", ".docx", ".doc"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {file_ext}"
+            )
+        
+        # Save temporarily
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = uploads_dir / file.filename
+        
+        content = await file.read()
+        with open(temp_path, "wb") as f:
+            f.write(content)
+        
+        parser = DocumentParser()
+        result = parser.parse_document(str(temp_path), use_ocr=True, detect_stamps=False)
+        
+        # Clean up
+        try:
+            temp_path.unlink()
+        except:
+            pass
+        
+        return {
+            "success": True,
+            "file_name": file.filename,
+            "text": result.get("full_text", ""),
+            "text_length": len(result.get("full_text", "")),
+            "document_type": result.get("document_type"),
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error extracting text: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error: {str(exc)}"
+        ) from exc
+
+
+@app.post("/api/detect-stamps")
+async def detect_stamps_in_file(file: UploadFile = File(...)) -> dict:
+    """
+    Detect stamps/seals in document (chỉ trích dấu mộc).
+    """
+    try:
+        if file.filename is None:
+            raise ValueError("File name is required")
+        
+        file_ext = Path(file.filename).suffix.lower()
+        if file_ext not in [".pdf", ".docx", ".doc"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {file_ext}"
+            )
+        
+        # Save temporarily
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = uploads_dir / file.filename
+        
+        content = await file.read()
+        with open(temp_path, "wb") as f:
+            f.write(content)
+        
+        parser = DocumentParser()
+        result = parser.parse_document(str(temp_path), use_ocr=True, detect_stamps=True)
+        
+        # Clean up
+        try:
+            temp_path.unlink()
+        except:
+            pass
+        
+        return {
+            "success": True,
+            "file_name": file.filename,
+            "document_type": result.get("document_type"),
+            "stamps": result.get("all_stamps", []),
+            "stamp_count": len(result.get("all_stamps", [])),
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error detecting stamps: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error: {str(exc)}"
+        ) from exc
+
+
+@app.get("/api/ocr/status")
+def ocr_status() -> dict:
+    """
+    Check OCR service status.
+    """
+    try:
+        ocr_service = OCRService()
+        return {
+            "status": "ready",
+            "ocr_engine": "EasyOCR",
+            "languages": ["vi", "en"],
+            "gpu_enabled": False,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+
