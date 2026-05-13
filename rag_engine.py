@@ -174,18 +174,62 @@ def _similarity_search_with_optional_filter(
 
 
 def _ocr_image(pil_image: Any, lang: str = "vie+eng") -> str:
-    """OCR một PIL Image. Trả về chuỗi rỗng nếu pytesseract chưa cài."""
+    """OCR PIL Image — thử nhiều preprocessing × PSM mode, lấy kết quả dài nhất."""
     if not _OCR_AVAILABLE:
         return ""
-    try:
-        return pytesseract.image_to_string(pil_image, lang=lang) or ""
-    except Exception:
+
+    import sys
+
+    gray = pil_image.convert("L")
+    binary = gray.point(lambda p: 0 if p < 200 else 255, "L")
+
+    attempts = [
+        (binary, "--psm 11"),
+        (gray,   "--psm 11"),
+        (pil_image, "--psm 11"),
+        (binary, "--psm 6"),
+        (gray,   "--psm 6"),
+        (binary, "--psm 3"),
+    ]
+
+    candidates: list[str] = []
+    for img, cfg in attempts:
+        try:
+            text = (pytesseract.image_to_string(img, lang=lang, config=cfg) or "").strip()
+            if text:
+                candidates.append(text)
+        except Exception:
+            pass
+
+    if not candidates:
+        print("[OCR] all attempts returned empty", file=sys.stderr)
         return ""
+
+    return max(candidates, key=len)
+
+
+def _render_pdf_page_to_image(tmp_path: str, page_idx: int, resolution: int = 200) -> Any:
+    """Render một trang PDF thành PIL Image dùng pypdfium2 (renderer thật, hỗ trợ ảnh nhúng)."""
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(tmp_path)
+        try:
+            page = pdf[page_idx]
+            scale = resolution / 72.0
+            bitmap = page.render(scale=scale, rotation=0)
+            return bitmap.to_pil()
+        finally:
+            pdf.close()
+    except Exception as exc:
+        import sys
+        print(f"[OCR] render failed page {page_idx}: {exc}", file=sys.stderr)
+        return None
 
 
 def _load_pdf_with_pdfplumber(tmp_path: str) -> List[Document]:
     """Load PDF: extract text layer + OCR các trang ít chữ (ảnh, scan)."""
     import pdfplumber
+    import sys
 
     documents: List[Document] = []
     with pdfplumber.open(tmp_path) as pdf:
@@ -193,17 +237,29 @@ def _load_pdf_with_pdfplumber(tmp_path: str) -> List[Document]:
             text = (page.extract_text() or "").strip()
 
             if _OCR_AVAILABLE and len(text) < _OCR_TEXT_THRESHOLD:
-                try:
-                    pil_img = page.to_image(resolution=200).original
+                pil_img = _render_pdf_page_to_image(tmp_path, page_idx, resolution=300)
+                if pil_img is not None:
                     ocr_text = _ocr_image(pil_img).strip()
                     if ocr_text:
                         text = (text + "\n" + ocr_text).strip() if text else ocr_text
-                except Exception:
-                    pass
+                    else:
+                        print(f"[OCR] page {page_idx}: OCR returned empty", file=sys.stderr)
+                else:
+                    print(f"[OCR] page {page_idx}: render returned None", file=sys.stderr)
 
             if text:
                 documents.append(Document(
                     page_content=text,
+                    metadata={"page": page_idx},
+                ))
+            elif _OCR_AVAILABLE:
+                # Trang có ảnh nhưng OCR không đọc được text — giữ lại để index không fail
+                documents.append(Document(
+                    page_content=(
+                        f"Trang {page_idx + 1} của tài liệu chứa hình ảnh hoặc đồ họa. "
+                        "Hệ thống OCR đã cố gắng nhận dạng nhưng không trích xuất được nội dung chữ. "
+                        "Tài liệu này có thể là ảnh chụp, con dấu, biểu đồ hoặc scan không rõ nét."
+                    ),
                     metadata={"page": page_idx},
                 ))
 
@@ -274,6 +330,7 @@ def _normalize_extracted_text(text: str) -> str:
 
 
 def _load_docx_with_python_docx(path: str, file_name: str) -> List[Document]:
+    import io
     docx_file = DocxDocument(path)
 
     paragraph_texts = [p.text.strip() for p in docx_file.paragraphs if p.text and p.text.strip()]
@@ -285,7 +342,22 @@ def _load_docx_with_python_docx(path: str, file_name: str) -> List[Document]:
             if cleaned_cells:
                 table_rows.append(" | ".join(cleaned_cells))
 
-    combined_text = "\n".join([*paragraph_texts, *table_rows])
+    # OCR ảnh nhúng trong DOCX
+    image_texts: List[str] = []
+    if _OCR_AVAILABLE:
+        from PIL import Image
+        for rel in docx_file.part.rels.values():
+            if "image" in rel.reltype:
+                try:
+                    img_bytes = rel.target_part.blob
+                    pil_img = Image.open(io.BytesIO(img_bytes))
+                    ocr_text = _ocr_image(pil_img).strip()
+                    if ocr_text:
+                        image_texts.append(ocr_text)
+                except Exception:
+                    pass
+
+    combined_text = "\n".join([*paragraph_texts, *table_rows, *image_texts])
     normalized_text = _normalize_extracted_text(combined_text)
     if not normalized_text:
         raise ValueError(f"Không trích xuất được nội dung từ file DOCX: {file_name}")
